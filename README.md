@@ -29,8 +29,8 @@ Two cases are excluded from caching automatically:
 
 ## Requirements
 
-- A running `iobroker.hue` instance (bridge IP/port picked up automatically).
-- A running `iobroker.loxone` instance.
+- A [Loxone](https://www.loxone.com/) Miniserver with a LightControllerV2 block, and a running `iobroker.loxone` instance.
+- A [Philips Hue](https://www.philips-hue.com/) bridge, and a running `iobroker.hue` instance (bridge IP/port picked up automatically).
 - For scene acceleration: lamps belonging to a Loxone LightControllerV2 block (`moodList`/`activeMoodsNum`). Lamps without a mood concept still work via direct forwarding.
 
 ## Installation
