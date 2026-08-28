@@ -35,15 +35,9 @@ Two cases are automatically excluded from caching, purely based on behavior, not
 
 ## Installation
 
-Not yet listed in the official ioBroker adapter catalog. Install manually:
+Once accepted into the official ioBroker adapter catalog, install it from **Admin → Adapters** like any other adapter. Until then, see the repository's release page for the current status.
 
-```bash
-iobroker url https://github.com/Infi001/ioBroker.lox2hue lox2hue
-```
-
-(or copy the directory directly to `/opt/iobroker/node_modules/iobroker.lox2hue` — **important**: it must be a real copy, not a symlink outside this path, see "Known limitations" below.)
-
-Then create an instance and configure it as described below.
+After installing, create an instance and configure it as described below.
 
 ## Configuration
 
@@ -63,7 +57,7 @@ Fill in the three-column table:
 
 ## Known limitations
 
-- Local, working version — not yet an official ioBroker adapter catalog entry (no `repochecker` pass yet, no automated CI runs against the published package).
+- Not yet an official ioBroker adapter catalog entry.
 - Hue bridge access happens directly (bypassing `iobroker.hue`), since that adapter doesn't support scene management. Credentials are read live from its configuration.
 - Tested against Hue bridge API v1 (CLIP v1, `apiversion` 1.78.0).
 - The RGB→color-temperature approximation for white-ambiance lamps is an approximation (McCamy's formula), not an exact conversion — saturated colors (pure red/green/blue) have no physically meaningful color temperature, so the result is clamped to a plausible range.

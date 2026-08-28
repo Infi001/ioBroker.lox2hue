@@ -84,7 +84,10 @@
           "xs": 12,
           "sm": 4,
           "min": 1,
-          "max": 65535
+          "max": 65535,
+          "md": 4,
+          "lg": 4,
+          "xl": 4
         },
         "hueBridgeUser": {
           "type": "text",
@@ -93,7 +96,10 @@
             "de": "Hue-Bridge-API-Token"
           },
           "xs": 12,
-          "sm": 4
+          "sm": 4,
+          "md": 4,
+          "lg": 4,
+          "xl": 4
         },
         "_advanced": {
           "type": "header",
@@ -110,7 +116,12 @@
             "en": "How long a light visibly fades between its old and new brightness/color. In milliseconds - 700 ms is a smooth, unhurried default; 0 = instant/no fade.",
             "de": "Wie lange eine Lampe sichtbar zwischen altem und neuem Helligkeits-/Farbwert überblendet. In Millisekunden - 700 ms ist ein sanfter, nicht hektischer Standardwert; 0 = sofort/keine Überblendung."
           },
-          "newLine": true
+          "newLine": true,
+          "xs": 12,
+          "sm": 6,
+          "md": 6,
+          "lg": 4,
+          "xl": 4
         },
         "onFadeMs": {
           "type": "number",
@@ -123,7 +134,10 @@
           "sm": 3,
           "min": 0,
           "max": 10000,
-          "step": 100
+          "step": 100,
+          "md": 3,
+          "lg": 4,
+          "xl": 4
         },
         "offFadeMs": {
           "type": "number",
@@ -135,7 +149,10 @@
           "sm": 3,
           "min": 0,
           "max": 10000,
-          "step": 100
+          "step": 100,
+          "md": 3,
+          "lg": 4,
+          "xl": 4
         },
         "debounceMs": {
           "type": "number",
@@ -202,10 +219,13 @@
             "en": "Some Loxone moods never settle because they constantly change color/brightness on their own (e.g. a \"Party\" scene). If a mood hasn't settled within this time, the adapter marks it as \"dynamic\" and stops trying to cache it as a fixed scene - it will instead be applied light-by-light every time.",
             "de": "Manche Loxone-Stimmungen kommen nie zur Ruhe, weil sie selbst ständig Farbe/Helligkeit ändern (z.B. eine \"Party\"-Szene). Kommt eine Stimmung innerhalb dieser Zeit nicht zur Ruhe, markiert der Adapter sie als \"dynamisch\" und versucht nicht mehr, sie als feste Szene zwischenzuspeichern - sie wird stattdessen jedes Mal Lampe für Lampe angewendet."
           },
-          "xs": 6,
+          "xs": 12,
           "sm": 3,
           "min": 5000,
-          "max": 300000
+          "max": 300000,
+          "md": 3,
+          "lg": 4,
+          "xl": 4
         },
         "sceneMinLights": {
           "type": "number",
@@ -217,10 +237,13 @@
             "en": "Below this many lights in a room, the overhead of creating/maintaining a dedicated Hue Bridge scene isn't worth it - the adapter just applies each light individually instead.",
             "de": "Unterhalb dieser Lampenzahl pro Raum lohnt sich der Aufwand für eine eigene Hue-Bridge-Szene nicht - der Adapter wendet die Lampen dann einfach einzeln an."
           },
-          "xs": 6,
+          "xs": 12,
           "sm": 3,
           "min": 2,
-          "max": 50
+          "max": 50,
+          "md": 3,
+          "lg": 4,
+          "xl": 4
         },
         "_colorIntro": {
           "type": "staticText",
@@ -241,10 +264,13 @@
             "de": "Gilt nur für White-Ambiance-Lampen (einstellbares Weiß, keine Farbe), deren Loxone-Ausgang ein REINER Dimmer ist (überhaupt keine Farbinfo) - Loxone kann in dem Fall keinen Warmton ausdrücken, deshalb wird dieser Fixwert nur in dem Moment gesetzt, in dem die Lampe von aus auf an wechselt; spätere Helligkeitsänderungen fassen ihn nicht mehr an, du kannst also jederzeit in der Hue-App nachjustieren, ohne dass der Adapter dagegen ankämpft. Auf 0 setzen, um ihn nie automatisch zu setzen. Ist der Loxone-Ausgang dagegen RGB, die gekoppelte Hue-Lampe aber nur White-Ambiance, leitet der Adapter stattdessen bei jeder Änderung automatisch eine angenäherte Farbtemperatur direkt aus der RGB-Farbe ab (nicht einstellbar, immer aktiv) - dieser Fixwert kommt dann nicht zum Einsatz. Mired-Skala: niedriger = kühleres/bläulicheres Licht, höher = wärmeres/orangeres Licht; typischer Bereich 153 (sehr kühl) bis 500 (sehr warm), 454 ist ein warmes, kerzenähnliches Weiß."
           },
           "newLine": true,
-          "xs": 6,
+          "xs": 12,
           "sm": 3,
           "min": 0,
-          "max": 500
+          "max": 500,
+          "md": 3,
+          "lg": 4,
+          "xl": 4
         },
         "rgbBrightnessFactor": {
           "type": "number",
@@ -256,11 +282,14 @@
             "en": "Scales down the MAXIMUM brightness of color (RGB) lights only - has no effect on color/hue accuracy. E.g. 0.4 means Loxone's 100% brightness only ever reaches 40% of the light's true maximum. Lower this if color lights look too intense/harsh next to white lights at full brightness; raise towards 1.0 for full brightness range.",
             "de": "Skaliert nur die MAXIMALE Helligkeit von Farblampen (RGB) - hat keinen Einfluss auf die Farbgenauigkeit. Z.B. bedeutet 0.4: Loxones 100% Helligkeit erreicht nie mehr als 40% der tatsächlichen Maximalhelligkeit der Lampe. Niedriger stellen, wenn Farblampen bei voller Helligkeit zu grell neben weißen Lampen wirken; Richtung 1.0 erhöhen für vollen Helligkeitsbereich."
           },
-          "xs": 6,
+          "xs": 12,
           "sm": 3,
           "min": 0.05,
           "max": 1,
-          "step": 0.05
+          "step": 0.05,
+          "md": 3,
+          "lg": 4,
+          "xl": 4
         }
       }
     },
