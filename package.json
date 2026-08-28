@@ -7,7 +7,7 @@
   "homepage": "https://github.com/Infi001/ioBroker.lox2hue",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Infi001/ioBroker.lox2hue.git"
+    "url": "git+https://github.com/Infi001/ioBroker.lox2hue.git"
   },
   "bugs": {
     "url": "https://github.com/Infi001/ioBroker.lox2hue/issues"
