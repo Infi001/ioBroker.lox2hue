@@ -5,7 +5,15 @@
 
 Mirrors Loxone light-control moods (LightControllerV2) onto Philips Hue lamps. Loxone stays the master — every change on a configured Loxone output is forwarded immediately to the assigned Hue lamp.
 
-## Why
+## The idea
+
+Loxone is great at building automation — switches, sensors, schedules, moods — but its own lighting outputs (dimmer/RGB channels) are limited compared to what modern smart bulbs can do. Philips Hue, on the other hand, is great at the bulbs themselves (rich colors, tunable white, wide device ecosystem) but has no real building-automation brain of its own.
+
+Many households end up running both systems side by side, controlled separately, which defeats the point of having a single smart-home setup: switches trigger Loxone, but the Hue lamps plugged into that circuit don't know anything about Loxone's moods, scenes, or schedules.
+
+This adapter closes that gap. It connects ioBroker's Loxone adapter to its Hue adapter so that every Loxone light-control output — and every mood switch on a LightControllerV2 block — also drives the matching Hue lamp, correctly translated (brightness, color, color temperature) for whatever that lamp actually supports. Loxone stays fully in charge (switches, moods, schedules, visualization all keep working exactly as before); Hue just becomes the "last mile" that finally shows the result. You get Loxone's automation logic and Hue's lamp quality in one system, instead of picking one or living with two disconnected ones.
+
+## Why the scene cache
 
 Switching many Hue lamps one command at a time makes them turn on visibly one after another, not simultaneously — the Hue bridge processes individual commands serially. A real Hue group/scene action, on the other hand, is a Zigbee broadcast: all affected lamps switch at the same instant.
 
@@ -75,8 +83,10 @@ Fill in the three-column table:
 - "Off" watchdog with periodic correction.
 - Bilingual (German/English) admin UI with auto-refreshing Loxone context display.
 
+Older entries: see [CHANGELOG_OLD.md](CHANGELOG_OLD.md).
+
 ## License
 
 MIT
 
-Copyright (c) 2026 f.herold@gmail.com
+Copyright (c) 2026 Infi001

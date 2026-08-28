@@ -136,8 +136,8 @@
           "max": 10000,
           "step": 100,
           "md": 3,
-          "lg": 4,
-          "xl": 4
+          "lg": 3,
+          "xl": 3
         },
         "offFadeMs": {
           "type": "number",
@@ -151,8 +151,8 @@
           "max": 10000,
           "step": 100,
           "md": 3,
-          "lg": 4,
-          "xl": 4
+          "lg": 3,
+          "xl": 3
         },
         "debounceMs": {
           "type": "number",
@@ -168,7 +168,10 @@
           "xs": 12,
           "sm": 3,
           "min": 50,
-          "max": 2000
+          "max": 2000,
+          "md": 3,
+          "lg": 3,
+          "xl": 3
         },
         "watchdogIntervalMin": {
           "type": "number",
