@@ -1,0 +1,35 @@
+{
+  "name": "iobroker.loxone2hue",
+  "version": "0.1.0",
+  "description": "Spiegelt Loxone-Lichtsteuerungs-Stimmungen auf Philips-Hue-Lampen, mit Szenen-Cache pro Raum für nahezu gleichzeitiges Schalten.",
+  "author": "f.herold@gmail.com",
+  "license": "MIT",
+  "homepage": "https://github.com/Infi001/loxone2hue",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Infi001/loxone2hue.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Infi001/loxone2hue/issues"
+  },
+  "keywords": [
+    "ioBroker",
+    "loxone",
+    "hue",
+    "philips",
+    "smarthome"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@iobroker/adapter-core": "^3.0.0"
+  },
+  "main": "main.js",
+  "files": [
+    "admin/",
+    "io-package.json",
+    "main.js",
+    "LICENSE"
+  ]
+}

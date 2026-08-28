@@ -1,0 +1,94 @@
+{
+  "common": {
+    "name": "loxone2hue",
+    "version": "0.1.0",
+    "news": {
+      "0.1.0": {
+        "en": "initial local version",
+        "de": "erste lokale Version"
+      }
+    },
+    "title": "Loxone to Hue Bridge",
+    "titleLang": {
+      "en": "Loxone to Hue Bridge",
+      "de": "Loxone-zu-Hue-Brücke"
+    },
+    "desc": {
+      "en": "Mirrors Loxone LightControllerV2 mood scenes to Philips Hue lights. Learns the target values per room+mood and, once learned, applies them to all lights in that room in a single Hue Bridge scene call instead of many sequential per-light commands - fixing the staggered/sequential switching that happens with plain per-light control. Dynamic scenes (continuously changing colors) and manual adjustments are detected automatically and excluded from caching.",
+      "de": "Spiegelt Loxone-Lichtsteuerungs-Stimmungen (LightControllerV2) auf Philips-Hue-Lampen. Lernt pro Raum und Stimmung die Zielwerte und wendet sie, sobald gelernt, über einen einzigen Hue-Bridge-Szenenaufruf statt vieler einzelner Lampenbefehle an - das behebt das nacheinander wirkende Schalten bei reiner Einzellampen-Steuerung. Dynamische Szenen (staendig wechselnde Farben) und manuelle Anpassungen werden automatisch erkannt und vom Cache ausgeschlossen."
+    },
+    "authors": [
+      "f.herold@gmail.com"
+    ],
+    "keywords": [
+      "loxone",
+      "hue",
+      "philips",
+      "lighting",
+      "smarthome"
+    ],
+    "license": "MIT",
+    "platform": "Javascript/Node.js",
+    "main": "main.js",
+    "icon": "loxone2hue.png",
+    "enabled": true,
+    "extIcon": "https://raw.githubusercontent.com/Infi001/loxone2hue/main/admin/loxone2hue.png",
+    "readme": "https://github.com/Infi001/loxone2hue/blob/main/README.md",
+    "mode": "daemon",
+    "type": "lighting",
+    "compact": false,
+    "connectionType": "local",
+    "dataSource": "push",
+    "messagebox": true,
+    "adminUI": {
+      "config": "json"
+    },
+    "dependencies": [
+      {
+        "js-controller": ">=5.0.0"
+      }
+    ],
+    "materialize": true
+  },
+  "native": {
+    "hueInstance": "hue.0",
+    "loxoneInstance": "loxone.0",
+    "hueBridgeHost": "",
+    "hueBridgePort": 443,
+    "hueBridgeUser": "",
+    "debounceMs": 200,
+    "watchdogIntervalMin": 5,
+    "onFadeMs": 700,
+    "offFadeMs": 700,
+    "settleMs": 8000,
+    "dynamicGiveUpMs": 30000,
+    "sceneMinLights": 3,
+    "forceWarmWhiteMired": 454,
+    "rgbBrightnessFactor": 0.4,
+    "devices": []
+  },
+  "objects": [],
+  "instanceObjects": [
+    {
+      "_id": "info",
+      "type": "channel",
+      "common": {
+        "name": "Information"
+      },
+      "native": {}
+    },
+    {
+      "_id": "info.connection",
+      "type": "state",
+      "common": {
+        "role": "indicator.connected",
+        "name": "Hue and Loxone adapters reachable",
+        "type": "boolean",
+        "read": true,
+        "write": false,
+        "def": false
+      },
+      "native": {}
+    }
+  ]
+}
