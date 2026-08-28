@@ -1,72 +1,88 @@
-# ioBroker.loxone2hue
+# ioBroker.lox2hue
 
+[![NPM version](https://img.shields.io/npm/v/iobroker.lox2hue.svg)](https://www.npmjs.com/package/iobroker.lox2hue)
 [![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/flohero)
 
-Spiegelt Loxone-Lichtsteuerungs-Stimmungen (LightControllerV2) auf Philips-Hue-Lampen. Loxone bleibt der Master — jede Änderung eines konfigurierten Loxone-Ausgangs wird sofort an die zugeordnete Hue-Lampe weitergegeben.
+Mirrors Loxone light-control moods (LightControllerV2) onto Philips Hue lamps. Loxone stays the master — every change on a configured Loxone output is forwarded immediately to the assigned Hue lamp.
 
-## Warum
+## Why
 
-Steuert man viele Hue-Lampen einzeln (ein Befehl pro Lampe), schalten sie sichtbar nacheinander statt gleichzeitig — die Hue-Bridge verarbeitet viele Einzelbefehle seriell. Eine echte Hue-Gruppen-/Szenen-Aktion dagegen ist ein Zigbee-Broadcast: alle betroffenen Lampen schalten zeitgleich.
+Switching many Hue lamps one command at a time makes them turn on visibly one after another, not simultaneously — the Hue bridge processes individual commands serially. A real Hue group/scene action, on the other hand, is a Zigbee broadcast: all affected lamps switch at the same instant.
 
-Dieser Adapter lernt deshalb pro Raum (jeder mit `activeMoodsNum` erkannte Loxone-Lichtsteuerungsbaustein) und Stimmung die Zielwerte aller zugeordneten Lampen. Ist eine Stimmung einmal "eingeschwungen" (einige Sekunden ohne weitere Änderung), legt der Adapter dafür automatisch eine eigene, unsichtbare (`recycle`) Hue-Bridge-Szene an. Beim nächsten Aufruf derselben Stimmung genügt ein einziger Bridge-Aufruf statt N Einzelbefehlen.
+This adapter therefore learns, per room (every Loxone light-control block detected via `activeMoodsNum`) and per mood, the target values of all assigned lamps. Once a mood has "settled" (a few seconds without further change), the adapter automatically creates its own hidden (`recycle`) Hue bridge scene for it. The next time that same mood is triggered, a single bridge call is enough instead of N individual commands.
 
-Zwei Fälle werden automatisch — rein am Verhalten, nicht am Namen — von der Zwischenspeicherung ausgeschlossen:
+Two cases are automatically excluded from caching, purely based on behavior, not naming:
 
-- **Manueller Modus**: Loxone meldet `activeMoodsNum < 0`, wenn keine definierte Stimmung mehr exakt passt (z. B. nach manuellem Nachjustieren einer Lampe).
-- **Dynamische Szenen** (z. B. "Party", "Wellness" mit ständig wechselnden Farben): kommt eine Stimmung länger als die konfigurierte Zeit nicht zur Ruhe, gilt sie als dynamisch und wird dauerhaft ausgeschlossen — Loxone steuert sie weiterhin live durch.
+- **Manual mode**: Loxone reports `activeMoodsNum < 0` whenever no defined mood matches exactly anymore (e.g. after manually readjusting a lamp).
+- **Dynamic scenes** (e.g. "Party", "Wellness" with constantly changing colors): if a mood doesn't settle within the configured time, it's treated as dynamic and permanently excluded from caching — Loxone keeps driving it live.
 
-## Funktionen im Überblick
+## Features at a glance
 
-- **Szenen-Cache pro Raum** (siehe oben) für nahezu gleichzeitiges Schalten.
-- **Mehrere Hue-Lampen an einem Loxone-Ausgang** werden korrekt unterstützt (z. B. zwei baugleiche Deckenspots an einem gemeinsamen Analogausgang) — alle bekommen das Kommando.
-- **Getrennte Ein-/Ausschalt-Überblendzeit** (in Millisekunden), pro Adapter-Instanz einstellbar.
-- **Farbtemperatur für White-Ambiance-Lampen**: ein fester Wert wird nur beim Einschalten gesetzt (nie beim bloßen Nachdimmen) — spätere manuelle Anpassungen in der Hue-App werden dadurch nicht ständig überschrieben. Kommt Farbinfo (RGB) vom Loxone-Ausgang, aber die Hue-Lampe kann nur Farbtemperatur (kein echtes RGB), wird die Farbe automatisch als Farbtemperatur angenähert.
-- **Tradfri-Sonderfall**: Tradfri-Lampen reagieren unzuverlässig auf den normalen Hue-`.command`-Pfad und werden deshalb über eigene `.level`/`.ct`-States angesteuert (inkl. korrekter Kelvin- statt Mired-Umrechnung für die Farbtemperatur).
-- **"Aus"-Wächter**: prüft periodisch, ob Lampen, die laut Loxone aus sein sollten, tatsächlich aus sind, und korrigiert sie bei Bedarf nach.
-- **Automatisch aktuell gehaltene Loxone-Kontext-Anzeige** in der Konfiguration (zeigt Gruppe, Loxone-Name und erkannten Lampentyp direkt in der Zuordnungstabelle) plus manueller Aktualisieren-Button ohne Adapter-Neustart.
-- **Zweisprachige Admin-Oberfläche** (Deutsch/Englisch, folgt der ioBroker-Admin-Spracheinstellung).
+- **Per-room scene cache** (see above) for near-simultaneous switching.
+- **Multiple Hue lamps on one Loxone output** are correctly supported (e.g. two identical ceiling spots on a shared analog output) — all of them receive the command.
+- **Separate on/off fade time** (in milliseconds), configurable per adapter instance.
+- **Color temperature for white-ambiance lamps**: a fixed value is applied only on switch-on (never on a plain dim change), so later manual adjustments in the Hue app aren't constantly overwritten. If color info (RGB) is available from the Loxone output but the Hue lamp only supports color temperature (no real RGB), the color is automatically approximated as a color temperature.
+- **Tradfri special case**: Tradfri lamps respond unreliably to the normal Hue `.command` path and are therefore driven via their own `.level`/`.ct` states (including the correct Kelvin, instead of mired, conversion for color temperature).
+- **"Off" watchdog**: periodically checks whether lamps that should be off according to Loxone actually are, and corrects them if needed.
+- **Automatically kept-up-to-date Loxone context display** in the configuration (shows group, Loxone name, and detected lamp type directly in the mapping table) plus a manual refresh button that works without an adapter restart.
+- **Bilingual admin UI** (German/English, follows the ioBroker admin language setting).
 
-## Voraussetzungen
+## Requirements
 
-- Ein laufender `iobroker.hue`-Adapter (lokaler Bridge-Zugriff, `bridge`/`port` werden automatisch übernommen).
-- Ein laufender `iobroker.loxone`-Adapter.
-- Für die Szenen-Beschleunigung: Lampen, die zu einem Loxone-Lichtsteuerungsbaustein (LightControllerV2, mit `moodList`/`activeMoodsNum`) gehören. Einzelne Lampen ohne Stimmungs-Konzept funktionieren auch — dort greift nur die direkte Weiterleitung, keine Szenen-Beschleunigung.
+- A running `iobroker.hue` adapter instance (local bridge access — `bridge`/`port` are picked up automatically).
+- A running `iobroker.loxone` adapter instance.
+- For scene acceleration: lamps that belong to a Loxone light-control block (LightControllerV2, with `moodList`/`activeMoodsNum`). Individual lamps without a mood concept also work — only direct forwarding applies there, no scene acceleration.
 
 ## Installation
 
-Noch kein offizieller Eintrag im ioBroker-Adapter-Katalog. Manuell installieren:
+Not yet listed in the official ioBroker adapter catalog. Install manually:
 
 ```bash
-iobroker url https://github.com/Infi001/loxone2hue loxone2hue
+iobroker url https://github.com/Infi001/ioBroker.lox2hue lox2hue
 ```
 
-(oder das Verzeichnis direkt nach `/opt/iobroker/node_modules/iobroker.loxone2hue` kopieren — **wichtig**: es muss eine echte Kopie sein, kein Symlink außerhalb dieses Pfads, siehe "Bekannte Stolperfallen" unten.)
+(or copy the directory directly to `/opt/iobroker/node_modules/iobroker.lox2hue` — **important**: it must be a real copy, not a symlink outside this path, see "Known limitations" below.)
 
-Danach eine Instanz anlegen und wie unten beschrieben konfigurieren.
+Then create an instance and configure it as described below.
 
-## Konfiguration
+## Configuration
 
-**Tab "Basic Settings"**
+**"Basic Settings" tab**
 
-1. **Hue-Adapter-Instanz** und **Loxone-Adapter-Instanz** auswählen.
-2. **Hue-Bridge-API-Token** eintragen (einmalig von Hand — steht in der Konfiguration der Hue-Adapter-Instanz im Feld "Nutzer", ist dort aber geschützt und lässt sich nicht automatisch übernehmen). Bridge-IP wird automatisch aus der Hue-Adapter-Konfiguration übernommen, falls das Feld leer bleibt.
-3. Feineinstellungen (Ein-/Ausschalt-Überblendzeit, Sammel-Zeitfenster, Aus-Prüfintervall, Szenen-Ruhezeit, Farbtemperatur-Fixwert, Helligkeits-Obergrenze für Farblampen usw.) bei Bedarf anpassen — jede mit erklärendem Hilfetext, die Defaults passen für die meisten Installationen.
+1. Select the **Hue adapter instance** and **Loxone adapter instance**.
+2. Enter the **Hue bridge API token** (one-time, by hand — it's in the Hue adapter instance's configuration under "user", but that field is protected there and can't be picked up automatically). The bridge IP is taken automatically from the Hue adapter configuration if the field is left empty.
+3. Adjust fine-tuning settings if needed (on/off fade time, batching window, off-check interval, scene settle time, fixed color temperature, brightness ceiling for color lamps, etc.) — each one has an explanatory help text, and the defaults work for most installations.
 
-**Tab "Lamps"**
+**"Lamps" tab**
 
-Tabelle mit drei Spalten füllen:
+Fill in the three-column table:
 
-- **Loxone output**: den Lichtsteuerungs-Ausgangsblock selbst auswählen (z. B. "AI2"), nicht einen seiner Einzelwerte — der Adapter ermittelt automatisch anhand des erkannten Hue-Lampentyps, ob `.rgb`, `.position` oder `.active` genutzt wird.
-- **Loxone context**: rein informativ, nicht editierbar — zeigt Gruppe, Loxone-Namen und erkannten Lampentyp. Die Gruppe wird direkt im ersten Textabschnitt (vor dem `::`) eingetragen/geändert. Nach dem Speichern per Button **"Refresh Loxone context"** sofort aktualisieren, ohne den Adapter neu zu starten.
-- **Hue lamp/group**: die zugehörige Hue-Lampe oder -Gruppe.
+- **Loxone output**: select the light-control output block itself (e.g. "AI2"), not one of its individual values — the adapter automatically determines whether `.rgb`, `.position`, or `.active` is used, based on the detected Hue lamp type.
+- **Loxone context**: informational only, not editable — shows group, Loxone name, and detected lamp type. The group is entered/changed directly in the first text section (before the `::`). After saving, use the **"Refresh Loxone context"** button to update it immediately, without restarting the adapter.
+- **Hue lamp/group**: the associated Hue lamp or group.
 
-## Bekannte Einschränkungen
+## Known limitations
 
-- Lokale, funktionsfähige Version — noch kein offizieller ioBroker-Adapter-Katalog-Eintrag (kein `adapter-checker`-Durchlauf, keine automatisierten Tests/CI).
-- Hue-Bridge-Zugriff erfolgt direkt (an `iobroker.hue` vorbei), da der Adapter keine Szenen-Verwaltung unterstützt. Zugangsdaten werden live aus dessen Konfiguration gelesen.
-- Getestet mit Hue-Bridge-API v1 (CLIP v1, `apiversion` 1.78.0).
-- RGB→Farbtemperatur-Annäherung für White-Ambiance-Lampen ist eine Näherung (McCamys Formel), keine exakte Umrechnung — gesättigte Farben (reines Rot/Grün/Blau) haben physikalisch keine sinnvolle Farbtemperatur, das Ergebnis wird auf einen plausiblen Bereich begrenzt.
+- Local, working version — not yet an official ioBroker adapter catalog entry (no `repochecker` pass yet, no automated CI runs against the published package).
+- Hue bridge access happens directly (bypassing `iobroker.hue`), since that adapter doesn't support scene management. Credentials are read live from its configuration.
+- Tested against Hue bridge API v1 (CLIP v1, `apiversion` 1.78.0).
+- The RGB→color-temperature approximation for white-ambiance lamps is an approximation (McCamy's formula), not an exact conversion — saturated colors (pure red/green/blue) have no physically meaningful color temperature, so the result is clamped to a plausible range.
 
-## Lizenz
+## Changelog
+
+### 0.1.0 (2026-08-28)
+
+- Initial public release.
+- Per-room/per-mood Hue scene caching for near-simultaneous switching.
+- Support for multiple Hue lamps sharing one Loxone output.
+- Configurable on/off fade times.
+- Switch-on-only color-temperature forcing for white-ambiance lamps, with RGB→mired approximation when the Loxone output is a genuine color picker.
+- Tradfri Kelvin/mired special-case handling.
+- "Off" watchdog with periodic correction.
+- Bilingual (German/English) admin UI with auto-refreshing Loxone context display.
+
+## License
 
 MIT
+
+Copyright (c) 2026 f.herold@gmail.com

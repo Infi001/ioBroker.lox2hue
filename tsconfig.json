@@ -1,0 +1,12 @@
+{
+    "extends": "@tsconfig/node20/tsconfig.json",
+    "compilerOptions": {
+        "module": "commonjs",
+        "moduleResolution": "node",
+        "allowJs": true,
+        "checkJs": false,
+        "noEmit": true
+    },
+    "include": ["**/*.js"],
+    "exclude": ["node_modules/**", "admin/**", "test/**"]
+}

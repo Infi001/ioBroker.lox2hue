@@ -1,0 +1,11 @@
+node_modules/
+npm-debug.log
+.DS_Store
+Thumbs.db
+*.log
+/.nyc_output
+/coverage
+/.vscode/.ropeproject
+.idea
+tsconfig.tsbuildinfo
+.dev-server/

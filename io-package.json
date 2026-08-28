@@ -1,21 +1,47 @@
 {
   "common": {
-    "name": "loxone2hue",
+    "name": "lox2hue",
     "version": "0.1.0",
     "news": {
       "0.1.0": {
         "en": "initial local version",
-        "de": "erste lokale Version"
+        "de": "erste lokale Version",
+        "ru": "первая локальная версия",
+        "pt": "versão local inicial",
+        "nl": "eerste lokale versie",
+        "fr": "version locale initiale",
+        "it": "prima versione locale",
+        "es": "versión local inicial",
+        "pl": "pierwsza wersja lokalna",
+        "uk": "перша локальна версія",
+        "zh-cn": "首个本地版本"
       }
     },
-    "title": "Loxone to Hue Bridge",
     "titleLang": {
       "en": "Loxone to Hue Bridge",
-      "de": "Loxone-zu-Hue-Brücke"
+      "de": "Loxone-zu-Hue-Brücke",
+      "ru": "Мост Loxone-Hue",
+      "pt": "Ponte Loxone para Hue",
+      "nl": "Loxone-naar-Hue-brug",
+      "fr": "Passerelle Loxone vers Hue",
+      "it": "Ponte Loxone-Hue",
+      "es": "Puente Loxone a Hue",
+      "pl": "Most Loxone-Hue",
+      "uk": "Міст Loxone-Hue",
+      "zh-cn": "Loxone 转 Hue 桥接"
     },
     "desc": {
       "en": "Mirrors Loxone LightControllerV2 mood scenes to Philips Hue lights. Learns the target values per room+mood and, once learned, applies them to all lights in that room in a single Hue Bridge scene call instead of many sequential per-light commands - fixing the staggered/sequential switching that happens with plain per-light control. Dynamic scenes (continuously changing colors) and manual adjustments are detected automatically and excluded from caching.",
-      "de": "Spiegelt Loxone-Lichtsteuerungs-Stimmungen (LightControllerV2) auf Philips-Hue-Lampen. Lernt pro Raum und Stimmung die Zielwerte und wendet sie, sobald gelernt, über einen einzigen Hue-Bridge-Szenenaufruf statt vieler einzelner Lampenbefehle an - das behebt das nacheinander wirkende Schalten bei reiner Einzellampen-Steuerung. Dynamische Szenen (staendig wechselnde Farben) und manuelle Anpassungen werden automatisch erkannt und vom Cache ausgeschlossen."
+      "de": "Spiegelt Loxone-Lichtsteuerungs-Stimmungen (LightControllerV2) auf Philips-Hue-Lampen. Lernt pro Raum und Stimmung die Zielwerte und wendet sie, sobald gelernt, über einen einzigen Hue-Bridge-Szenenaufruf statt vieler einzelner Lampenbefehle an - das behebt das nacheinander wirkende Schalten bei reiner Einzellampen-Steuerung. Dynamische Szenen (staendig wechselnde Farben) und manuelle Anpassungen werden automatisch erkannt und vom Cache ausgeschlossen.",
+      "ru": "Отражает сценарии настроения Loxone LightControllerV2 на лампы Philips Hue. Изучает целевые значения для каждой комнаты и настроения и применяет их одним вызовом сцены Hue Bridge вместо множества последовательных команд - это устраняет заметное поочерёдное переключение ламп. Динамические сцены (постоянно меняющиеся цвета) и ручные изменения распознаются автоматически и исключаются из кэширования.",
+      "pt": "Espelha as cenas de ambiente do Loxone LightControllerV2 para lâmpadas Philips Hue. Aprende os valores-alvo por cômodo e cena e, uma vez aprendidos, aplica-os a todas as lâmpadas do cômodo numa única chamada de cena da Hue Bridge em vez de vários comandos sequenciais - corrigindo a comutação sequencial visível. Cenas dinâmicas (cores em mudança constante) e ajustes manuais são detetados automaticamente e excluídos do cache.",
+      "nl": "Spiegelt Loxone LightControllerV2-sfeerscènes naar Philips Hue-lampen. Leert per kamer en sfeer de doelwaarden en past ze, eenmaal geleerd, toe op alle lampen in die kamer met één enkele Hue Bridge-scène-aanroep in plaats van veel losse lampopdrachten - dit verhelpt het merkbaar na elkaar schakelen. Dynamische scènes (voortdurend wisselende kleuren) en handmatige aanpassingen worden automatisch herkend en van caching uitgesloten.",
+      "fr": "Reflète les scènes d'ambiance Loxone LightControllerV2 vers les lampes Philips Hue. Apprend les valeurs cibles par pièce et par ambiance puis, une fois apprises, les applique à toutes les lampes de la pièce via un seul appel de scène Hue Bridge au lieu de nombreuses commandes séquentielles - corrigeant le basculement visible et décalé. Les scènes dynamiques (couleurs changeant sans cesse) et les ajustements manuels sont détectés automatiquement et exclus de la mise en cache.",
+      "it": "Rispecchia le scene di atmosfera Loxone LightControllerV2 sulle lampade Philips Hue. Apprende i valori target per stanza e atmosfera e, una volta appresi, li applica a tutte le lampade della stanza con un'unica chiamata di scena Hue Bridge invece di molti comandi sequenziali - risolvendo la commutazione sfalsata visibile. Le scene dinamiche (colori in continuo cambiamento) e le regolazioni manuali vengono rilevate automaticamente ed escluse dalla cache.",
+      "es": "Refleja las escenas de ambiente de Loxone LightControllerV2 en lámparas Philips Hue. Aprende los valores objetivo por habitación y ambiente y, una vez aprendidos, los aplica a todas las lámparas de la habitación mediante una única llamada de escena de Hue Bridge en lugar de muchos comandos secuenciales - corrigiendo el encendido escalonado visible. Las escenas dinámicas (colores en constante cambio) y los ajustes manuales se detectan automáticamente y se excluyen de la caché.",
+      "pl": "Odwzorowuje sceny nastroju Loxone LightControllerV2 na lampach Philips Hue. Uczy się wartości docelowych dla każdego pomieszczenia i nastroju, a po nauczeniu stosuje je do wszystkich lamp w pomieszczeniu jednym wywołaniem sceny Hue Bridge zamiast wielu kolejnych poleceń - eliminując widoczne kolejne przełączanie. Sceny dynamiczne (stale zmieniające się kolory) i ręczne korekty są wykrywane automatycznie i wykluczane z buforowania.",
+      "uk": "Відображає сценарії настрою Loxone LightControllerV2 на лампи Philips Hue. Вивчає цільові значення для кожної кімнати й настрою та застосовує їх одним викликом сцени Hue Bridge замість багатьох послідовних команд - усуваючи помітне почергове перемикання. Динамічні сцени (кольори, що постійно змінюються) та ручні коригування розпізнаються автоматично й виключаються з кешування.",
+      "zh-cn": "将 Loxone LightControllerV2 的情景模式映射到 Philips Hue 灯具。按房间和情景学习目标值，学习完成后通过单次 Hue Bridge 场景调用而非多条连续的单灯命令来应用 - 解决了逐灯依次切换的问题。持续变化颜色的动态场景以及手动调整会被自动识别并排除在缓存之外。"
     },
     "authors": [
       "f.herold@gmail.com"
@@ -27,15 +53,18 @@
       "lighting",
       "smarthome"
     ],
-    "license": "MIT",
+    "licenseInformation": {
+      "license": "MIT",
+      "type": "free"
+    },
     "platform": "Javascript/Node.js",
-    "main": "main.js",
-    "icon": "loxone2hue.png",
+    "icon": "lox2hue.png",
     "enabled": true,
-    "extIcon": "https://raw.githubusercontent.com/Infi001/loxone2hue/main/admin/loxone2hue.png",
-    "readme": "https://github.com/Infi001/loxone2hue/blob/main/README.md",
+    "extIcon": "https://raw.githubusercontent.com/Infi001/ioBroker.lox2hue/main/admin/lox2hue.png",
+    "readme": "https://github.com/Infi001/ioBroker.lox2hue/blob/main/README.md",
     "mode": "daemon",
     "type": "lighting",
+    "tier": 3,
     "compact": false,
     "connectionType": "local",
     "dataSource": "push",
@@ -45,10 +74,14 @@
     },
     "dependencies": [
       {
-        "js-controller": ">=5.0.0"
+        "js-controller": ">=6.0.11"
       }
     ],
-    "materialize": true
+    "globalDependencies": [
+      {
+        "admin": ">=7.6.17"
+      }
+    ]
   },
   "native": {
     "hueInstance": "hue.0",
