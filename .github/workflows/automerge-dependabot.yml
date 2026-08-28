@@ -21,8 +21,8 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Check if PR should be auto-merged
-        uses: ahmadnassri/action-dependabot-auto-merge@v2
+        uses: iobroker-bot-orga/action-automerge-dependabot@v1
         with:
           github-token: ${{ secrets.AUTO_MERGE_TOKEN }}
-          # By default, squash and merge, so Github chooses nice commit messages
-          command: squash and merge
+          # Squash and merge, so Github chooses nice commit messages
+          merge-method: squash
