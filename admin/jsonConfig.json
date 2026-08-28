@@ -325,7 +325,12 @@
             "en": "All lamps in one list. For 'Loxone output', pick the light-controller output BLOCK itself (e.g. \"AI2\"), not one of its individual sub-values - the adapter automatically figures out and uses the right one (.rgb/.position/.active) based on your Hue lamp's detected type. 'Loxone context' is read-only/informational, kept up to date by the adapter itself (format \"group::Loxone name (Type X)\") - it's not editable here.",
             "de": "Alle Lampen in einer Liste. Bei 'Loxone-Ausgang' den Lichtsteuerungs-Ausgangsblock selbst auswählen (z.B. \"AI2\"), nicht einen seiner Einzelwerte - der Adapter ermittelt automatisch anhand des erkannten Hue-Lampentyps, welcher davon (.rgb/.position/.active) genutzt wird. 'Loxone-Kontext' ist rein informativ und wird vom Adapter selbst aktuell gehalten (Format \"Gruppe::Loxone-Name (Type X)\") - hier nicht editierbar."
           },
-          "newLine": true
+          "newLine": true,
+          "xs": 12,
+          "sm": 12,
+          "md": 12,
+          "lg": 12,
+          "xl": 12
         },
         "_refreshContext": {
           "type": "sendTo",
@@ -342,7 +347,9 @@
           "newLine": true,
           "xs": 12,
           "sm": 6,
-          "md": 4
+          "md": 4,
+          "lg": 4,
+          "xl": 4
         },
         "devices": {
           "type": "table",
@@ -392,7 +399,11 @@
                 "channel"
               ]
             }
-          ]
+          ],
+          "sm": 12,
+          "md": 12,
+          "lg": 12,
+          "xl": 12
         }
       }
     }
