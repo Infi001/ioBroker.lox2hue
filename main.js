@@ -3,30 +3,52 @@
 /*
  * ioBroker.lox2hue
  *
- * Spiegelt Loxone-Lichtsteuerungs-Stimmungen (LightControllerV2) auf Philips-Hue-Lampen.
- * Loxone bleibt der Master: jede Aenderung eines konfigurierten Loxone-Analogausgangs
- * (.rgb / .position / .active) wird sofort an die zugeordnete Hue-Lampe weitergegeben.
+ * Mirrors Loxone light-control moods (LightControllerV2) onto Philips Hue lamps.
+ * Loxone stays the master: every change on a configured Loxone analog output
+ * (.rgb / .position / .active) is forwarded immediately to the assigned Hue lamp.
  *
- * Zusaetzlich lernt der Adapter pro Raum (Loxone-Lichtsteuerungsbaustein) und Stimmung
- * (activeMoodsNum) die Zielwerte aller zugeordneten Lampen. Sobald eine Stimmung einmal
- * "eingeschwungen" ist (8s lang keine Aenderung mehr), legt der Adapter dafuer eine eigene,
- * minimale Philips-Hue-Bridge-Szene an. Beim naechsten Aufruf derselben Stimmung wird nur
- * noch diese eine Szene abgerufen (ein einziger Bridge-Aufruf) statt N Einzelbefehle -
- * das behebt das nacheinander wirkende Schalten, das bei reiner Einzellampen-Steuerung
- * durch die Bridge/Zigbee-Verarbeitung entsteht.
+ * The adapter additionally learns, per room (Loxone light-control block) and mood
+ * (activeMoodsNum), the target values of all assigned lamps. Once a mood has
+ * "settled" (8s with no further change), the adapter creates its own minimal
+ * Philips Hue bridge scene for it. The next time that same mood is triggered, only
+ * that one scene is recalled (a single bridge call) instead of N individual
+ * commands - this fixes the staggered/sequential switching that plain per-lamp
+ * control causes via the bridge/Zigbee processing.
  *
- * Zwei Faelle werden automatisch von der Zwischenspeicherung ausgeschlossen (rein am
- * Verhalten erkannt, nicht am Namen):
- *  - Manueller Modus: Loxone meldet activeMoodsNum < 0, wenn keine definierte Stimmung
- *    mehr exakt passt (z.B. weil eine Lampe von Hand nachjustiert wurde).
- *  - Dynamische Szenen (z.B. "Party"): kommt eine Stimmung laenger als
- *    dynamicGiveUpMs nicht zur Ruhe, gilt sie als dynamisch und wird dauerhaft
- *    ausgeschlossen.
+ * Two cases are excluded from caching automatically (detected purely by behavior,
+ * not by name):
+ *  - Manual mode: Loxone reports activeMoodsNum < 0 whenever no defined mood
+ *    matches exactly anymore (e.g. because a lamp was readjusted by hand).
+ *  - Dynamic scenes (e.g. "Party"): if a mood doesn't settle within
+ *    dynamicGiveUpMs, it's treated as dynamic and permanently excluded.
  */
 
 const utils = require('@iobroker/adapter-core');
 const https = require('node:https');
-const colorMath = require('./lib/colorMath');
+const commandLogic = require('./lib/commandLogic');
+
+/**
+ * Human-readable capability label for logs and the admin UI's Loxone-context
+ * display. Returns 'Unknown' when detection found no usable capability at all
+ * (e.g. a deleted Hue device or a typo'd id) - previously this silently fell
+ * through to 'Switch', making a completely broken mapping look like a correctly
+ * detected on/off device.
+ *
+ * @param {object} type Device capabilities as produced by detectDevice()
+ * @returns {'RGB'|'Dimmer'|'Switch'|'Unknown'} The detected capability label
+ */
+function capabilityLabel(type) {
+    if (type.isRGB) {
+        return 'RGB';
+    }
+    if (type.isDimmer) {
+        return 'Dimmer';
+    }
+    if (type.isSwitch) {
+        return 'Switch';
+    }
+    return 'Unknown';
+}
 
 class Loxone2Hue extends utils.Adapter {
     constructor(options) {
@@ -36,13 +58,14 @@ class Loxone2Hue extends utils.Adapter {
         this.roomGroups = {}; // roomKey -> { members: [{loxoneId,hueId}], activeMoodsId, currentMoodNum, currentMoodSince, settleTimer }
         this.sceneCache = {}; // roomKey -> { [moodNum]: { lights: {...}, bridgeSceneId } | { dynamic:true } }
         this.pendingChanges = new Map(); // hueId -> { loxoneId, hueId, val }
-        this.loxoneToHue = new Map(); // fullLoxoneId -> Array<{ roomKey, hueId }> (mehrere Lampen pro Loxone-Ausgang moeglich)
+        this.loxoneToHue = new Map(); // fullLoxoneId -> Array<{ roomKey, hueId }> (multiple lamps per Loxone output are possible)
         this.activeMoodsToRoom = new Map(); // activeMoodsId -> roomKey
         this.debounceTimer = null;
         this.cacheSaveTimer = null;
         this.watchdogInterval = null;
-        this.stateExistsCache = new Map(); // id -> boolean, kleine Abkuerzung fuer wiederholte existsState-Abfragen
-        this.lastKnownOn = new Map(); // hueId -> boolean, rein intern (kein Bridge-Roundtrip) fuer warAn()
+        this.stateExistsCache = new Map(); // id -> boolean, small shortcut for repeated existsState lookups
+        this.lastKnownOn = new Map(); // hueId -> boolean, purely internal (no bridge round-trip) for wasOn()
+        this.bridgeReachable = undefined; // tracked live via hueBridgeRequest()/onReady(), see setBridgeReachable()
 
         this.on('ready', this.onReady.bind(this));
         this.on('stateChange', this.onStateChange.bind(this));
@@ -51,7 +74,7 @@ class Loxone2Hue extends utils.Adapter {
     }
 
     // ---------------------------------------------------------------
-    // Hilfsfunktionen: State-Existenz/-Zugriff mit kleinem Cache
+    // Helpers: state existence/access with a small cache
     // ---------------------------------------------------------------
     async stateExists(id) {
         if (this.stateExistsCache.has(id)) {
@@ -69,16 +92,16 @@ class Loxone2Hue extends utils.Adapter {
     }
 
     // ---------------------------------------------------------------
-    // Hue-Bridge direkt ansprechen (an der Adapter-Abstraktion vorbei) -
-    // noetig fuer Szenen-Anlage/-Abruf, das kann iobroker.hue nicht.
+    // Talk to the Hue bridge directly (bypassing the adapter abstraction) - needed
+    // for scene creation/recall, which iobroker.hue itself cannot do.
     // ---------------------------------------------------------------
     async initHueBridge() {
-        // Bridge-IP/-Port lassen sich bequem aus der hue-Adapter-Konfiguration uebernehmen
-        // (nicht geschuetzt), als Vorbelegung/Fallback, falls in dieser Adapter-Instanz nicht
-        // explizit gesetzt. Der API-Nutzer/Token ("user") ist bei iobroker.hue als
-        // "protectedNative" markiert und daher per getForeignObject aus einem ANDEREN Adapter
-        // NICHT lesbar (kommt als undefined zurueck, auch wenn die CLI/Admin-UI ihn zeigt) -
-        // muss deshalb explizit in dieser Adapter-Konfiguration eingetragen werden.
+        // Bridge IP/port are conveniently taken from the hue adapter's own config
+        // (not protected there), as a default/fallback if not explicitly set on this
+        // adapter instance. The API user/token ("user") is marked as "protectedNative"
+        // on iobroker.hue and therefore CANNOT be read via getForeignObject from
+        // ANOTHER adapter (comes back as undefined, even though the CLI/admin UI shows
+        // it) - it must therefore be entered explicitly in this adapter's own config.
         let fallbackHost, fallbackPort;
         try {
             const hueAdapterObj = await this.getForeignObjectAsync(`system.adapter.${this.config.hueInstance}`);
@@ -87,7 +110,7 @@ class Loxone2Hue extends utils.Adapter {
                 fallbackPort = hueAdapterObj.native.port;
             }
         } catch {
-            /* egal, dann eben nur die eigene Konfiguration */
+            /* fine, fall back to just this adapter's own config */
         }
 
         this.hueBridgeHost = this.config.hueBridgeHost || fallbackHost;
@@ -107,6 +130,26 @@ class Loxone2Hue extends utils.Adapter {
                     }-Instanz, Feld "Nutzer"/"user" - dort geschützt, ` +
                     `muss hier einmalig manuell eingetragen werden).`,
             );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Marks the Hue bridge as (un)reachable, and updates info.connection to reflect
+    // live connectivity rather than just "adapter start-up succeeded" - previously
+    // info.connection was set true once at the end of onReady() and never touched
+    // again, so a bridge that went offline later stayed silently invisible (still
+    // reported as connected) other than error-level log lines.
+    // ---------------------------------------------------------------
+    setBridgeReachable(reachable) {
+        if (this.bridgeReachable === reachable) {
+            return;
+        }
+        this.bridgeReachable = reachable;
+        this.setState('info.connection', reachable, true);
+        if (reachable) {
+            this.log.info('Hue-Bridge erreichbar.');
+        } else {
+            this.log.warn('Hue-Bridge nicht erreichbar - Netzwerk/Bridge-Status prüfen.');
         }
     }
 
@@ -133,6 +176,7 @@ class Loxone2Hue extends utils.Adapter {
                         chunks += c;
                     });
                     res.on('end', () => {
+                        this.setBridgeReachable(true);
                         try {
                             resolve(JSON.parse(chunks));
                         } catch {
@@ -141,8 +185,14 @@ class Loxone2Hue extends utils.Adapter {
                     });
                 },
             );
-            req.on('error', reject);
-            req.setTimeout(5000, () => req.destroy(new Error('Timeout')));
+            req.on('error', err => {
+                this.setBridgeReachable(false);
+                reject(err);
+            });
+            req.setTimeout(5000, () => {
+                this.setBridgeReachable(false);
+                req.destroy(new Error('Timeout'));
+            });
             if (data) {
                 req.write(data);
             }
@@ -151,7 +201,7 @@ class Loxone2Hue extends utils.Adapter {
     }
 
     // ---------------------------------------------------------------
-    // Geraete-Erkennung (RGB / Dimmer / Schalter, Gruppe oder Einzellampe)
+    // Device detection (RGB / Dimmer / Switch, group or single lamp)
     // ---------------------------------------------------------------
     async detectDevice(hueId, loxoneBaseId) {
         if (this.deviceCapabilities[hueId]) {
@@ -182,19 +232,20 @@ class Loxone2Hue extends utils.Adapter {
         if (type.isRGB) {
             type.loxoneSuffix = '.rgb';
         } else if (type.isDimmer) {
-            // Weiss-Ambiance-Lampe (kein echtes RGB) - trotzdem ".rgb" abonnieren statt
-            // ".position", WENN dieser Loxone-Ausgang selbst als echter Farbregler
-            // konfiguriert ist (Loxone-Bausteintyp "ColorPickerV2"/"ColorPicker", nicht
-            // "Dimmer") - dann kann die Farbabsicht als Farbtemperatur angenaehert werden
-            // (siehe rgbZuMired() in berechneRohbefehl). Ein reiner "Dimmer"-Baustein hat
-            // dagegen gar keine Farbinfo, da bleibt ".position" richtig. Nutzerwunsch 28.08.
-            let loxoneIstFarbregler = false;
+            // White-ambiance lamp (no real RGB) - still subscribe to ".rgb" instead of
+            // ".position" WHEN this Loxone output is itself configured as a genuine
+            // color picker (Loxone block type "ColorPickerV2"/"ColorPicker", not
+            // "Dimmer") - then the color intent can be approximated as a color
+            // temperature (see rgbToMired() usage in lib/commandLogic.js). A plain
+            // "Dimmer" block, on the other hand, has no color info at all, so
+            // ".position" remains correct there. User request 28.08.
+            let loxoneIsColorPicker = false;
             if (loxoneBaseId) {
                 const loxObj = await this.getForeignObjectAsync(loxoneBaseId);
                 const controlType = loxObj && loxObj.native && loxObj.native.control && loxObj.native.control.type;
-                loxoneIstFarbregler = /color/i.test(controlType || '');
+                loxoneIsColorPicker = /color/i.test(controlType || '');
             }
-            type.loxoneSuffix = loxoneIstFarbregler ? '.rgb' : '.position';
+            type.loxoneSuffix = loxoneIsColorPicker ? '.rgb' : '.position';
         } else {
             type.loxoneSuffix = '.active';
         }
@@ -205,208 +256,65 @@ class Loxone2Hue extends utils.Adapter {
         type.bridgeId = hueObj && hueObj.native && hueObj.native.id;
 
         this.deviceCapabilities[hueId] = type;
+        const label = capabilityLabel(type);
+        if (label === 'Unknown') {
+            // None of .on/.level/.xy/.hue exist under this id at all - most likely a
+            // typo'd Hue object id, or a lamp that was since deleted from the bridge.
+            // Without this warning such a mapping fails completely silently.
+            this.log.warn(
+                `[${hueId}] keine Fähigkeiten erkannt (.on/.level/.xy/.hue fehlen alle) - Hue-Objekt-ID prüfen, existiert die Lampe noch?`,
+            );
+        }
         this.log.debug(
-            `[INIT] ${hueId} (${isGroup ? 'GRUPPE' : 'LAMPE'}), Typ ${
-                type.isRGB ? 'RGB' : type.isDimmer ? 'Dimmer' : 'Switch'
-            }, lauscht auf ${type.loxoneSuffix}`,
+            `[INIT] ${hueId} (${isGroup ? 'GRUPPE' : 'LAMPE'}), Typ ${label}, lauscht auf ${type.loxoneSuffix}`,
         );
         return type;
     }
 
     // ---------------------------------------------------------------
-    // Prueft, ob eine Lampe VOR diesem Befehl an war - genutzt, um die feste
-    // Farbtemperatur nur beim Aus->An-Uebergang zu setzen, nicht bei jeder
-    // Helligkeitsaenderung waehrend sie schon an ist (sonst wuerde eine in der
-    // Hue-App manuell gewaehlte Farbtemperatur bei jedem Dimmen wieder
-    // ueberschrieben - Nutzerwunsch 28.08., damit die Hue-App fuer
-    // Farbtemperatur weiterhin nutzbar bleibt, so wie es vor diesem Adapter
-    // schon gehandhabt wurde).
+    // Checks whether a lamp was on BEFORE this command - used to only apply the
+    // fixed color temperature on the off->on transition, not on every brightness
+    // change while it's already on (otherwise a color temperature chosen manually in
+    // the Hue app would get overwritten on every dim step - user request 28.08., so
+    // the Hue app stays usable for color temperature, the way it was handled before
+    // this adapter existed).
     //
-    // Bewusst NICHT der Live-Hue-State (".on"), sondern ein rein intern selbst
-    // mitgefuehrter Zustand (lastKnownOn) - der Live-State braucht nach einem
-    // Befehl teils sehr lange (mehrere Minuten, beobachtet am 27./28.08.), bis
-    // die Bridge/der hue-Adapter ihn zurueckmeldet, waere also als Grundlage
-    // fuer diese Entscheidung viel zu unzuverlaessig.
-    warAn(hueId) {
+    // Deliberately NOT the live Hue state (".on"), but a purely internally tracked
+    // value (lastKnownOn) - the live state can take a very long time (several
+    // minutes, observed on 27./28.08.) to be reported back by the bridge/hue
+    // adapter, which would make it far too unreliable as a basis for this decision.
+    // ---------------------------------------------------------------
+    wasOn(hueId) {
         return this.lastKnownOn.get(hueId) === true;
     }
 
     // ---------------------------------------------------------------
-    // Duenner Wrapper um berechneRohbefehl(): merkt sich nach jeder Berechnung,
-    // ob die Lampe jetzt an oder aus sein wird (fuer warAn() bei der naechsten
-    // Berechnung, siehe dort). Bleibt "async", auch wenn intern kein I/O mehr
-    // steckt (warAn() ist jetzt rein intern/synchron) - so muessen die
-    // Aufrufstellen nicht nochmal angepasst werden.
+    // Stateful wrapper around commandLogic.computeRawCommand(): looks up this
+    // device's capabilities/wasOn() state, delegates the actual (pure, unit-tested)
+    // decision to lib/commandLogic.js, then remembers whether the lamp will now be
+    // on or off (for wasOn() on the next call, see above).
     // ---------------------------------------------------------------
     async computeCommand(inputVal, hueId) {
-        const cmd = this.berechneRohbefehl(inputVal, hueId);
-        if (cmd) {
-            this.lastKnownOn.set(hueId, !cmd.isOff);
-        }
-        return cmd;
-    }
-
-    // rgbZuXy()/rgbZuMired() (reine Funktionen, kein Adapter-Zustand) sind fuer
-    // Testbarkeit nach lib/colorMath.js ausgelagert (siehe test/unit.js), hier nur
-    // duenne Wrapper darum, damit der restliche Code unveraendert this.rgbZuXy(...)
-    // aufrufen kann.
-    rgbZuXy(r, g, b) {
-        return colorMath.rgbZuXy(r, g, b);
-    }
-
-    rgbZuMired(r, g, b) {
-        return colorMath.rgbZuMired(r, g, b);
-    }
-
-    berechneRohbefehl(inputVal, hueId) {
         const type = this.deviceCapabilities[hueId];
         if (!type) {
             return null;
         }
-        const isTradfri = /tradfri/i.test(hueId);
-        // Hue-Bridge-API erwartet "transitiontime" in Zehntelsekunden (Deciseconds) - die
-        // Admin-UI zeigt dagegen Millisekunden (verstaendlicher), deshalb hier umrechnen.
-        const offFade = Math.round((this.config.offFadeMs || 700) / 100);
-        const onFade = Math.round((this.config.onFadeMs || 700) / 100);
-        const rgbFactor = this.config.rgbBrightnessFactor;
-
-        let brightnessPercent = 0;
-        let rgbString = null;
-        let switchState = false;
-
-        if (typeof inputVal === 'string' && inputVal.includes(',')) {
-            rgbString = inputVal;
-            const parts = rgbString.split(',');
-            const r = parseFloat(parts[0]) || 0;
-            const g = parseFloat(parts[1]) || 0;
-            const b = parseFloat(parts[2]) || 0;
-            const maxVal = Math.max(r, g, b);
-            brightnessPercent = maxVal > 100 ? Math.round((maxVal / 255) * 100) : Math.round(maxVal);
-        } else {
-            brightnessPercent = Math.round(parseFloat(inputVal) || 0);
-            if (typeof inputVal === 'boolean') {
-                brightnessPercent = inputVal ? 100 : 0;
-            }
-            switchState = brightnessPercent > 0;
+        const cmd = commandLogic.computeRawCommand({
+            inputVal,
+            type,
+            isTradfri: /tradfri/i.test(hueId),
+            wasOn: this.wasOn(hueId),
+            config: {
+                offFadeMs: this.config.offFadeMs,
+                onFadeMs: this.config.onFadeMs,
+                rgbBrightnessFactor: this.config.rgbBrightnessFactor,
+                forceWarmWhiteMired: this.config.forceWarmWhiteMired,
+            },
+        });
+        if (cmd) {
+            this.lastKnownOn.set(hueId, !cmd.isOff);
         }
-
-        // A) RGB
-        if (type.isRGB && rgbString) {
-            const [r, g, b] = rgbString.split(',').map(v => Math.round((255 / 100) * parseInt(v.trim() || '0', 10)));
-            const hueBri = Math.round((Math.max(r, g, b) / 2.55) * rgbFactor);
-
-            if (hueBri === 0) {
-                return {
-                    groupable: true,
-                    isOff: true,
-                    writes: [
-                        {
-                            suffix: '.command',
-                            value: JSON.stringify({ on: false, transitiontime: offFade }),
-                        },
-                    ],
-                };
-            }
-            const xy = this.rgbZuXy(r, g, b);
-
-            return {
-                groupable: true,
-                isOff: false,
-                writes: [
-                    {
-                        suffix: '.command',
-                        value: JSON.stringify({
-                            on: true,
-                            xy,
-                            level: hueBri,
-                            transitiontime: onFade,
-                        }),
-                    },
-                ],
-            };
-        }
-
-        // B) Dimmer / White Ambiance
-        if (type.isDimmer) {
-            if (brightnessPercent <= 0) {
-                if (isTradfri) {
-                    return {
-                        groupable: false,
-                        isOff: true,
-                        writes: [{ suffix: '.on', value: false }],
-                    };
-                }
-                return {
-                    groupable: true,
-                    isOff: true,
-                    writes: [
-                        {
-                            suffix: '.command',
-                            value: JSON.stringify({ on: false, transitiontime: offFade }),
-                        },
-                    ],
-                };
-            }
-
-            // Farbtemperatur (mired) bestimmen - zwei ganz unterschiedliche Faelle:
-            let miredWert = null;
-            if (type.hasCT && rgbString) {
-                // Loxone-Ausgang ist RGB, aber diese Hue-Lampe kann nur Helligkeit+Farbtemperatur
-                // (kein echtes RGB) - statt die Farbinfo zu ignorieren, wird sie als Farbtemperatur
-                // angenaehert (siehe rgbZuMired()). Wird bei JEDER Aenderung neu berechnet (nicht
-                // nur beim Einschalten), weil Loxone hier aktiv eine Farbabsicht sendet - anders
-                // als der feste Wert unten, wo Loxone gar keine Farbinfo hat.
-                const [r, g, b] = rgbString
-                    .split(',')
-                    .map(v => Math.round((255 / 100) * parseInt(v.trim() || '0', 10)));
-                miredWert = this.rgbZuMired(r, g, b);
-            } else if (type.hasCT && this.config.forceWarmWhiteMired && !this.warAn(hueId)) {
-                // Loxone-Ausgang ist ein reiner Dimmer (kein RGB, keinerlei Farbinfo) - nur beim
-                // Aus->An-Uebergang den konfigurierten Fixwert setzen (siehe warAn()-Kommentar
-                // oben), damit spaetere manuelle Hue-App-Anpassungen beim Dimmen erhalten bleiben.
-                miredWert = this.config.forceWarmWhiteMired;
-            }
-
-            const command = {
-                on: true,
-                level: brightnessPercent,
-                transitiontime: onFade,
-            };
-            if (miredWert !== null) {
-                command.ct = miredWert;
-            }
-
-            if (isTradfri) {
-                const writes = [{ suffix: '.level', value: brightnessPercent }];
-                // Bug gefunden 28.08.: der separate ".ct"-State (genutzt statt .command, weil
-                // .command bei Tradfri unzuverlaessig ist) erwartet bei diesem Geraetetyp Kelvin
-                // (z.B. hue.0.Tradfri_Ankleide.ct: min 2203, max 4000, unit "K"), nicht mired wie
-                // der Hue-API-Standard ".command"-Pfad. forceWarmWhiteMired direkt durchgereicht
-                // wurde vom hue-Adapter als "unter Minimum" abgelehnt (Log: "value 454 less than
-                // min 2203") - die Lampe hat dadurch nie eine gueltige Farbtemperatur bekommen.
-                if (miredWert !== null) {
-                    const kelvin = Math.round(1000000 / miredWert);
-                    writes.push({ suffix: '.ct', value: kelvin, delayMs: 800 });
-                }
-                return { groupable: false, isOff: false, writes };
-            }
-            return {
-                groupable: true,
-                isOff: false,
-                writes: [{ suffix: '.command', value: JSON.stringify(command) }],
-            };
-        }
-
-        // C) Schalter
-        if (type.isSwitch) {
-            return {
-                groupable: true,
-                isOff: !switchState,
-                writes: [{ suffix: '.on', value: switchState }],
-            };
-        }
-
-        return null;
+        return cmd;
     }
 
     async applyCommand(hueId, prefix, cmd) {
@@ -436,8 +344,8 @@ class Loxone2Hue extends utils.Adapter {
     }
 
     // ---------------------------------------------------------------
-    // Debounce/Batch: mehrere Aenderungen im selben kurzen Fenster
-    // gemeinsam (parallel) verarbeiten statt einzeln nacheinander.
+    // Debounce/batch: process several changes within the same short window together
+    // (in parallel) instead of one after another.
     // ---------------------------------------------------------------
     scheduleAction(loxoneId, hueId, val) {
         this.pendingChanges.set(hueId, { loxoneId, hueId, val });
@@ -457,10 +365,10 @@ class Loxone2Hue extends utils.Adapter {
     }
 
     // ---------------------------------------------------------------
-    // Umwandlung eines internen Befehls (adapter-spezifische Feldnamen wie
-    // "level" 0-100) in ein rohes Hue-Bridge-Lightstate-Objekt ("bri" 0-254).
+    // Converts an internal command (adapter-specific field names such as "level"
+    // 0-100) into a raw Hue bridge lightstate object ("bri" 0-254).
     // ---------------------------------------------------------------
-    commandZuLightstate(cmd) {
+    commandToLightstate(cmd) {
         if (!cmd || !cmd.writes || !cmd.writes.length) {
             return null;
         }
@@ -491,21 +399,21 @@ class Loxone2Hue extends utils.Adapter {
         if (onWrite) {
             return { on: !!onWrite.value };
         }
-        return null; // z.B. Tradfri (getrennte .level/.ct-Writes) - nicht szenenfaehig
+        return null; // e.g. Tradfri (separate .level/.ct writes) - not scene-capable
     }
 
     // ---------------------------------------------------------------
-    // Raeume / Szenen-Cache
+    // Rooms / scene cache
     // ---------------------------------------------------------------
     loxoneRoomKey(loxoneBaseId) {
         return loxoneBaseId.substring(0, loxoneBaseId.lastIndexOf('.'));
     }
 
-    istManuellerModus(moodNum) {
+    isManualMode(moodNum) {
         return Number(moodNum) < 0;
     }
 
-    async ladeSzenenCache() {
+    async loadSceneCache() {
         const id = 'cache.szenen';
         await this.setObjectNotExistsAsync(id, {
             type: 'state',
@@ -527,7 +435,7 @@ class Loxone2Hue extends utils.Adapter {
         }
     }
 
-    speichereSzenenCacheDebounced() {
+    saveSceneCacheDebounced() {
         if (this.cacheSaveTimer) {
             this.clearTimeout(this.cacheSaveTimer);
         }
@@ -536,16 +444,16 @@ class Loxone2Hue extends utils.Adapter {
         }, 2000);
     }
 
-    markiereDynamisch(roomKey, moodNum) {
+    markDynamic(roomKey, moodNum) {
         if (!this.sceneCache[roomKey]) {
             this.sceneCache[roomKey] = {};
         }
-        const alt = this.sceneCache[roomKey][moodNum];
-        if (alt && alt.bridgeSceneId) {
-            this.hueBridgeRequest('DELETE', `/scenes/${alt.bridgeSceneId}`).catch(() => {});
+        const previous = this.sceneCache[roomKey][moodNum];
+        if (previous && previous.bridgeSceneId) {
+            this.hueBridgeRequest('DELETE', `/scenes/${previous.bridgeSceneId}`).catch(() => {});
         }
         this.sceneCache[roomKey][moodNum] = { dynamic: true };
-        this.speichereSzenenCacheDebounced();
+        this.saveSceneCacheDebounced();
         this.log.info(
             `[SZENE] ${roomKey} Mood ${moodNum} kommt seit über ${
                 this.config.dynamicGiveUpMs / 1000
@@ -553,7 +461,7 @@ class Loxone2Hue extends utils.Adapter {
         );
     }
 
-    planeSettleCheck(roomKey) {
+    scheduleSettleCheck(roomKey) {
         const room = this.roomGroups[roomKey];
         if (!room || !room.activeMoodsId) {
             return;
@@ -563,7 +471,7 @@ class Loxone2Hue extends utils.Adapter {
             room.currentMoodSince &&
             Date.now() - room.currentMoodSince > this.config.dynamicGiveUpMs
         ) {
-            this.markiereDynamisch(roomKey, String(room.currentMoodNum));
+            this.markDynamic(roomKey, String(room.currentMoodNum));
             if (room.settleTimer) {
                 this.clearTimeout(room.settleTimer);
                 room.settleTimer = null;
@@ -576,7 +484,7 @@ class Loxone2Hue extends utils.Adapter {
         room.settleTimer = this.setTimeout(() => this.snapshotRoom(roomKey), this.config.settleMs);
     }
 
-    async aktualisiereBridgeSzene(roomKey, moodNum, snap) {
+    async updateBridgeScene(roomKey, moodNum, snap) {
         const lightIds = [];
         const states = {};
         for (const hueId of Object.keys(snap)) {
@@ -584,7 +492,7 @@ class Loxone2Hue extends utils.Adapter {
             if (!type || !type.bridgeId) {
                 continue;
             }
-            const state = this.commandZuLightstate(snap[hueId]);
+            const state = this.commandToLightstate(snap[hueId]);
             if (!state) {
                 continue;
             }
@@ -595,15 +503,15 @@ class Loxone2Hue extends utils.Adapter {
             return null;
         }
 
-        const alteSceneId =
+        const previousSceneId =
             this.sceneCache[roomKey] &&
             this.sceneCache[roomKey][moodNum] &&
             this.sceneCache[roomKey][moodNum].bridgeSceneId;
-        if (alteSceneId) {
+        if (previousSceneId) {
             try {
-                await this.hueBridgeRequest('DELETE', `/scenes/${alteSceneId}`);
+                await this.hueBridgeRequest('DELETE', `/scenes/${previousSceneId}`);
             } catch {
-                /* egal */
+                /* fine */
             }
         }
         try {
@@ -638,7 +546,7 @@ class Loxone2Hue extends utils.Adapter {
             return;
         }
         const moodNum = String(await this.getForeignVal(room.activeMoodsId));
-        if (this.istManuellerModus(moodNum)) {
+        if (this.isManualMode(moodNum)) {
             this.log.debug(`[SZENE] ${roomKey} Mood ${moodNum} = manueller Modus -> wird nicht gecacht.`);
             return;
         }
@@ -654,7 +562,7 @@ class Loxone2Hue extends utils.Adapter {
                 snap[member.hueId] = cmd;
             }
         }
-        const bridgeSceneId = await this.aktualisiereBridgeSzene(roomKey, moodNum, snap);
+        const bridgeSceneId = await this.updateBridgeScene(roomKey, moodNum, snap);
         if (!this.sceneCache[roomKey]) {
             this.sceneCache[roomKey] = {};
         }
@@ -662,7 +570,7 @@ class Loxone2Hue extends utils.Adapter {
             lights: snap,
             bridgeSceneId: bridgeSceneId || undefined,
         };
-        this.speichereSzenenCacheDebounced();
+        this.saveSceneCacheDebounced();
         this.log.info(
             `[SZENE] ${roomKey} Mood ${moodNum} eingeschwungen, ${Object.keys(snap).length} Lampen gespeichert${
                 bridgeSceneId ? ` (+ Bridge-Szene ${bridgeSceneId})` : ''
@@ -670,7 +578,7 @@ class Loxone2Hue extends utils.Adapter {
         );
     }
 
-    async wendeEinzelnAn(lightsMap) {
+    async applyIndividually(lightsMap) {
         for (const hueId of Object.keys(lightsMap)) {
             const type = this.deviceCapabilities[hueId];
             if (type) {
@@ -679,8 +587,8 @@ class Loxone2Hue extends utils.Adapter {
         }
     }
 
-    async wendeSzeneSofortAn(roomKey, moodNum) {
-        if (this.istManuellerModus(moodNum)) {
+    async applySceneImmediately(roomKey, moodNum) {
+        if (this.isManualMode(moodNum)) {
             this.log.debug(`[SZENE] ${roomKey} Mood ${moodNum} = manueller Modus -> normaler Ablauf.`);
             return;
         }
@@ -708,7 +616,7 @@ class Loxone2Hue extends utils.Adapter {
                 this.log.warn(
                     `[SZENE] Bridge-Szenen-Abruf fehlgeschlagen (${e.message}) -> Einzelbefehle als Rückfall.`,
                 );
-                await this.wendeEinzelnAn(lightsMap);
+                await this.applyIndividually(lightsMap);
             }
             return;
         }
@@ -717,16 +625,16 @@ class Loxone2Hue extends utils.Adapter {
                 Object.keys(lightsMap).length
             } Lampen einzeln sofort setzen.`,
         );
-        await this.wendeEinzelnAn(lightsMap);
+        await this.applyIndividually(lightsMap);
     }
 
     // ---------------------------------------------------------------
-    // Aus-Wächter: prueft regelmaessig, ob Lampen die laut Loxone aus sein
-    // sollen tatsaechlich aus sind (fehlgeschlagene Befehle nachholen).
+    // Off watchdog: periodically checks whether lamps that should be off according
+    // to Loxone actually are (and re-sends failed commands).
     // ---------------------------------------------------------------
-    async pruefeUndKorrigiereAus() {
-        let geprueft = 0;
-        let korrigiert = 0;
+    async checkAndCorrectOff() {
+        let checked = 0;
+        let corrected = 0;
         for (const roomKey of Object.keys(this.roomGroups)) {
             for (const member of this.roomGroups[roomKey].members) {
                 const type = this.deviceCapabilities[member.hueId];
@@ -744,14 +652,14 @@ class Loxone2Hue extends utils.Adapter {
                 if (!(await this.stateExists(onStateId))) {
                     continue;
                 }
-                geprueft++;
+                checked++;
 
-                const istAn = (await this.getForeignVal(onStateId)) === true;
-                if (!istAn) {
+                const isOn = (await this.getForeignVal(onStateId)) === true;
+                if (!isOn) {
                     continue;
                 }
 
-                korrigiert++;
+                corrected++;
                 const reachableId = `${member.hueId}.reachable`;
                 const reachable = (await this.stateExists(reachableId)) ? await this.getForeignVal(reachableId) : null;
                 this.log.info(
@@ -762,71 +670,73 @@ class Loxone2Hue extends utils.Adapter {
                 await this.applyCommand(member.hueId, type.cmdPrefix, cmd);
             }
         }
-        if (korrigiert > 0) {
-            this.log.info(`[WÄCHTER] ${korrigiert} von ${geprueft} geprüften "Aus"-Lampen mussten korrigiert werden.`);
+        if (corrected > 0) {
+            this.log.info(`[WÄCHTER] ${corrected} von ${checked} geprüften "Aus"-Lampen mussten korrigiert werden.`);
         }
     }
 
     // ---------------------------------------------------------------
-    // Baut das "Loxone-Kontext"-Anzeigefeld (Format "Gruppe::Loxone-Name (Type X)")
-    // fuer alle Geraete neu auf und schreibt es zurueck in die Konfiguration, falls
-    // es sich geaendert hat. Wird sowohl beim Adapter-Start als auch manuell ueber
-    // den "Loxone-Kontext aktualisieren"-Button (Admin-UI, sendTo) aufgerufen.
+    // (Re)builds the "Loxone context" display field (format "Group::Loxone name
+    // (Type X)") for all devices and writes it back into the configuration if it
+    // changed. Called both on adapter start and manually via the "Refresh Loxone
+    // context" button (admin UI, sendTo).
     //
-    // "Gruppe" hat seit 28.08. kein eigenes Eingabefeld in der Admin-UI mehr (fuer
-    // eine 3-statt-4-spaltige Tabelle) - der Nutzer bearbeitet sie direkt im ersten
-    // Segment (vor dem ersten "::") dieses Kontext-Texts. "::" (statt einfachem ":"),
-    // damit es sich vom einzelnen ":" im Loxone-eigenen Namen selbst unterscheidet
-    // (z.B. "Lichtsteuerung Terrasse: Gartenbeet 1"). Deshalb hier NICHT einfach
-    // aus dem alten "group"-Feld neu zusammenbauen (das wuerde jede manuelle Aenderung
-    // verwerfen), sondern die Gruppe aus dem *aktuellen* loxoneInfo-Text zurueckparsen
-    // und nur den Rest (Loxone-Name, Typ) auffrischen. Fuer alte Eintraege ohne
-    // loxoneInfo-Text (Erstmigration) faellt es auf das alte "group"-Feld zurueck.
+    // "Group" no longer has its own input field in the admin UI as of 28.08. (to
+    // keep the table at three columns instead of four) - the user edits it directly
+    // in the first segment (before the first "::") of this context text. "::"
+    // (instead of a plain ":") so it's distinguishable from a single ":" that can
+    // appear in Loxone's own name (e.g. "Lichtsteuerung Terrasse: Gartenbeet 1").
+    // That's why this does NOT simply rebuild from the old "group" field (which
+    // would discard any manual edit) - instead the group is parsed back out of the
+    // *current* loxoneInfo text, and only the rest (Loxone name, type) is
+    // refreshed. Falls back to the old "group" field for legacy entries without a
+    // loxoneInfo text yet (initial migration).
     //
-    // @param devices Geraete-Array (wird in-place veraendert)
-    // @param nurBekannteGeraete true = nur schon erkannte Geraete (this.deviceCapabilities)
-    //   beruecksichtigen (beim Adapter-Start, subscribeForeignStatesAsync fuer neue
-    //   Geraete laeuft parallel ohnehin gerade); false = auch fuer noch unbekannte
-    //   Geraete live per detectDevice() nachschlagen (fuer den manuellen Button, damit
-    //   frisch gespeicherte, aber noch nicht per Neustart geladene Zeilen auch
-    //   funktionieren, ohne den ganzen Adapter neu starten zu muessen).
+    // @param devices Device array (mutated in place)
+    // @param onlyKnownDevices true = only consider already-detected devices
+    //   (this.deviceCapabilities) (on adapter start, subscribeForeignStatesAsync for
+    //   new devices is running in parallel anyway); false = also look up not-yet-known
+    //   devices live via detectDevice() (for the manual button, so freshly saved but
+    //   not-yet-restarted rows also work, without having to restart the whole adapter)
     // @returns {changed, total}
     // ---------------------------------------------------------------
-    async aktualisiereLoxoneKontext(devices, nurBekannteGeraete) {
+    async updateLoxoneContext(devices, onlyKnownDevices) {
         let changed = 0;
         let total = 0;
-        for (const d of devices) {
-            if (!d.loxoneId || !d.hueId) {
-                continue;
-            }
-            total++;
-            const normalisierteLoxoneId = d.loxoneId.replace(/\.(rgb|position|active)$/, '');
-            let type = this.deviceCapabilities[d.hueId];
-            if (!type && !nurBekannteGeraete) {
-                try {
-                    type = await this.detectDevice(d.hueId, normalisierteLoxoneId);
-                } catch {
-                    /* Hue-Geraet evtl. gerade nicht erreichbar */
+        await Promise.all(
+            devices.map(async d => {
+                if (!d.loxoneId || !d.hueId) {
+                    return;
                 }
-            }
-            if (!type) {
-                continue;
-            }
-            const loxObj = await this.getForeignObjectAsync(normalisierteLoxoneId);
-            const loxName = (loxObj && loxObj.common && loxObj.common.name) || normalisierteLoxoneId;
-            const typName = type.isRGB ? 'RGB' : type.isDimmer ? 'Dimmer' : 'Switch';
-            // Nur dann als "Gruppe::Name (Type X)"-Format vertrauen, wenn es auch danach
-            // aussieht (Marker "::") - sonst kommt der Wert evtl. gerade frisch von
-            // fillOnSelect (roher Loxone-Name ohne Gruppen-Praefix, User hat den
-            // Loxone-Ausgang gerade neu ausgewaehlt) und wuerde faelschlich als Gruppe
-            // interpretiert.
-            const gruppe = d.loxoneInfo && d.loxoneInfo.includes('::') ? d.loxoneInfo.split('::')[0] : d.group || '';
-            const neuerKontext = `${gruppe}::${loxName} (Type ${typName})`;
-            if (d.loxoneInfo !== neuerKontext) {
-                d.loxoneInfo = neuerKontext;
-                changed++;
-            }
-        }
+                total++;
+                const normalizedLoxoneId = d.loxoneId.replace(/\.(rgb|position|active)$/, '');
+                let type = this.deviceCapabilities[d.hueId];
+                if (!type && !onlyKnownDevices) {
+                    try {
+                        type = await this.detectDevice(d.hueId, normalizedLoxoneId);
+                    } catch {
+                        /* Hue device possibly unreachable right now */
+                    }
+                }
+                if (!type) {
+                    return;
+                }
+                const loxObj = await this.getForeignObjectAsync(normalizedLoxoneId);
+                const loxoneName = (loxObj && loxObj.common && loxObj.common.name) || normalizedLoxoneId;
+                const typeName = capabilityLabel(type);
+                // Only trust the value as "Group::Name (Type X)" if it actually looks
+                // like it (marker "::") - otherwise the value might just have come
+                // fresh from fillOnSelect (raw Loxone name without a group prefix,
+                // user just picked a new Loxone output) and would be wrongly
+                // interpreted as the group.
+                const group = d.loxoneInfo && d.loxoneInfo.includes('::') ? d.loxoneInfo.split('::')[0] : d.group || '';
+                const newContext = `${group}::${loxoneName} (Type ${typeName})`;
+                if (d.loxoneInfo !== newContext) {
+                    d.loxoneInfo = newContext;
+                    changed++;
+                }
+            }),
+        );
         if (changed > 0) {
             await this.extendForeignObjectAsync(`system.adapter.${this.namespace}`, {
                 native: { devices },
@@ -837,17 +747,17 @@ class Loxone2Hue extends utils.Adapter {
     }
 
     // ---------------------------------------------------------------
-    // Nachrichten von der Admin-UI (sendTo-Button "Loxone-Kontext aktualisieren").
-    // Liest die Konfiguration FRISCH aus der Objects-DB (nicht this.config, das ist
-    // nur der eingefrorene Stand vom letzten Adapter-Start) - dadurch wirkt der
-    // Button auch auf gerade erst gespeicherte Aenderungen, ganz ohne Neustart.
+    // Messages from the admin UI ("Refresh Loxone context" sendTo button). Reads
+    // the configuration FRESH from the objects DB (not this.config, which is only
+    // the frozen snapshot from the last adapter start) - this way the button also
+    // works on changes that were just saved, with no restart needed.
     // ---------------------------------------------------------------
     async onMessage(obj) {
         if (obj.command === 'refreshLoxoneContext') {
             try {
                 const selfObj = await this.getForeignObjectAsync(`system.adapter.${this.namespace}`);
                 const devices = (selfObj && selfObj.native && selfObj.native.devices) || [];
-                const result = await this.aktualisiereLoxoneKontext(devices, false);
+                const result = await this.updateLoxoneContext(devices, false);
                 if (obj.callback) {
                     this.sendTo(
                         obj.from,
@@ -860,6 +770,7 @@ class Loxone2Hue extends utils.Adapter {
                     );
                 }
             } catch (e) {
+                this.log.error(`[refreshLoxoneContext] ${e.message}`);
                 if (obj.callback) {
                     this.sendTo(obj.from, obj.command, { error: e.message }, obj.callback);
                 }
@@ -885,16 +796,17 @@ class Loxone2Hue extends utils.Adapter {
             this.log.error(e.message);
             return;
         }
-        await this.ladeSzenenCache();
+        await this.loadSceneCache();
 
-        // Lampen (Tab "Lamps") und Zonen (Tab "Zones", nur Namen+Reihenfolge) sind zwei
-        // unabhaengige, flache Listen - eine Lampe verschiebt man einfach, indem man ihr
-        // "group"-Feld auf einen anderen Zonennamen setzt. Der Rest des Codes kennt keine
-        // Zonen, nur die Loxone-Raumgruppierung (loxoneRoomKey).
-        // Loxone-ID normalisieren: der Objekt-Auswahldialog liefert oft den vollen State
-        // (z.B. loxone.0.<uuid>.AI9.rgb), waehrend der Rest des Codes mit der Basis-ID ohne
-        // .rgb/.position/.active-Suffix arbeitet (der Suffix wird ja selbst je nach erkanntem
-        // Lampentyp wieder angehaengt) - beide Eingabeformen funktionieren dadurch gleich gut.
+        // Lamps (tab "Lamps") and zones (tab "Zones", names+order only) are two
+        // independent, flat lists - a lamp is moved between zones simply by setting
+        // its "group" field to a different zone name. The rest of the code doesn't
+        // know about zones at all, only Loxone room grouping (loxoneRoomKey).
+        // Normalize the Loxone id: the object-selection dialog often returns the
+        // full state (e.g. loxone.0.<uuid>.AI9.rgb), while the rest of the code
+        // works with the base id without a .rgb/.position/.active suffix (the
+        // suffix is re-appended anyway depending on the detected lamp type) - both
+        // input forms therefore work equally well.
         const devices = (this.config.devices || [])
             .filter(d => d.loxoneId && d.hueId)
             .map(d => ({
@@ -902,7 +814,7 @@ class Loxone2Hue extends utils.Adapter {
                 loxoneId: d.loxoneId.replace(/\.(rgb|position|active)$/, ''),
             }));
 
-        // Raeume gruppieren
+        // Group into rooms
         for (const d of devices) {
             const roomKey = this.loxoneRoomKey(d.loxoneId);
             if (!this.roomGroups[roomKey]) {
@@ -917,27 +829,34 @@ class Loxone2Hue extends utils.Adapter {
             this.roomGroups[roomKey].members.push(d);
         }
 
-        // Geraete erkennen + Loxone-Aenderungen abonnieren
-        // WICHTIG: mehrere Hue-Lampen koennen am selben Loxone-Ausgang haengen (z.B. zwei
-        // baugleiche Deckenlampen an einem gemeinsamen Analogausgang) - loxoneToHue muss
-        // deshalb pro Loxone-ID eine LISTE von Zielen halten, nicht nur ein einzelnes Ziel
-        // (sonst ueberschreibt die zweite Lampe beim Setup einfach die erste, die dann nie
-        // wieder ein Kommando bekommt - Bug gefunden 28.08. an den Bad-Deckenlampen).
-        for (const d of devices) {
-            const type = await this.detectDevice(d.hueId, d.loxoneId);
-            const roomKey = this.loxoneRoomKey(d.loxoneId);
-            if (!this.loxoneToHue.has(type.fullLoxoneId)) {
-                this.loxoneToHue.set(type.fullLoxoneId, []);
-            }
-            this.loxoneToHue.get(type.fullLoxoneId).push({ roomKey, hueId: d.hueId });
-            await this.subscribeForeignStatesAsync(type.fullLoxoneId);
-        }
+        // Detect devices + subscribe to Loxone changes. Processed concurrently
+        // (Promise.all) rather than one device at a time, since each device's
+        // detection/subscription is independent - this keeps start-up time roughly
+        // constant instead of growing linearly with the number of configured lamps.
+        //
+        // IMPORTANT: several Hue lamps can hang off the same Loxone output (e.g. two
+        // identical ceiling lamps on one shared analog output) - loxoneToHue must
+        // therefore hold a LIST of targets per Loxone id, not just a single target
+        // (otherwise the second lamp would simply overwrite the first one during
+        // setup, and the first would then never receive another command - bug found
+        // 28.08. on the bathroom ceiling lamps).
+        await Promise.all(
+            devices.map(async d => {
+                const type = await this.detectDevice(d.hueId, d.loxoneId);
+                const roomKey = this.loxoneRoomKey(d.loxoneId);
+                if (!this.loxoneToHue.has(type.fullLoxoneId)) {
+                    this.loxoneToHue.set(type.fullLoxoneId, []);
+                }
+                this.loxoneToHue.get(type.fullLoxoneId).push({ roomKey, hueId: d.hueId });
+                await this.subscribeForeignStatesAsync(type.fullLoxoneId);
+            }),
+        );
 
-        // "Loxone-Kontext"-Anzeigefeld in der Admin-UI aktuell halten (siehe
-        // aktualisiereLoxoneKontext() weiter unten fuer Details/Begruendung).
-        await this.aktualisiereLoxoneKontext(this.config.devices || [], true);
+        // Keep the "Loxone context" display field in the admin UI up to date (see
+        // updateLoxoneContext() above for details/reasoning).
+        await this.updateLoxoneContext(this.config.devices || [], true);
 
-        // Pro Raum: activeMoodsNum abonnieren, falls vorhanden (Lichtsteuerungsbaustein)
+        // Per room: subscribe to activeMoodsNum, if present (light-control block)
         for (const roomKey of Object.keys(this.roomGroups)) {
             const activeMoodsId = `${roomKey}.activeMoodsNum`;
             if (await this.stateExists(activeMoodsId)) {
@@ -956,11 +875,11 @@ class Loxone2Hue extends utils.Adapter {
         }
 
         this.watchdogInterval = this.setInterval(
-            () => this.pruefeUndKorrigiereAus(),
+            () => this.checkAndCorrectOff(),
             this.config.watchdogIntervalMin * 60000,
         );
 
-        this.setState('info.connection', true, true);
+        this.setBridgeReachable(true);
         this.log.info(`lox2hue bereit: ${devices.length} Geräte in ${Object.keys(this.roomGroups).length} Räumen.`);
     }
 
@@ -974,7 +893,7 @@ class Loxone2Hue extends utils.Adapter {
             const room = this.roomGroups[roomKey];
             room.currentMoodNum = state.val;
             room.currentMoodSince = Date.now();
-            this.wendeSzeneSofortAn(roomKey, state.val).catch(e => this.log.error(e.message));
+            this.applySceneImmediately(roomKey, state.val).catch(e => this.log.error(e.message));
             return;
         }
 
@@ -982,7 +901,7 @@ class Loxone2Hue extends utils.Adapter {
         if (targets) {
             for (const target of targets) {
                 this.scheduleAction(id, target.hueId, state.val);
-                this.planeSettleCheck(target.roomKey);
+                this.scheduleSettleCheck(target.roomKey);
             }
         }
     }

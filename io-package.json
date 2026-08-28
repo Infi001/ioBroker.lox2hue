@@ -115,7 +115,10 @@
       "type": "state",
       "common": {
         "role": "indicator.connected",
-        "name": "Hue and Loxone adapters reachable",
+        "name": {
+          "en": "Hue bridge reachable",
+          "de": "Hue-Bridge erreichbar"
+        },
         "type": "boolean",
         "read": true,
         "write": false,
