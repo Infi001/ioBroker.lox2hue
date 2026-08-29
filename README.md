@@ -1,6 +1,7 @@
 # ioBroker.lox2hue
 
 [![NPM version](https://img.shields.io/npm/v/iobroker.lox2hue.svg)](https://www.npmjs.com/package/iobroker.lox2hue)
+
 [![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/flohero)
 
 Mirrors Loxone light-control moods (LightControllerV2) onto Philips Hue lamps. Loxone stays the master — every change on a configured Loxone output is forwarded immediately to the assigned Hue lamp.
