@@ -9,7 +9,7 @@ auf der Bridge cached, damit alle Lampen eines Raums gleichzeitig schalten.
 
 - `main.js`: Adapter-Lifecycle (`utils.Adapter`), State-Subscriptions (`activeMoodsNum`,
   Lampen-Outputs `.rgb`/`.position`/`.active`), Watchdog, Echo-Unterdrückung und
-  CLIP-v2-Zonen-/Szenen-Orchestrierung (`"lox2hue: <block>"` pro Raum, Schema v2 in `lox2hue.0.cache.szenen`).
+  CLIP-v2-Zonen-/Szenen-Orchestrierung (`"lox2hue: <block>"` pro Raum, Schema v2 in `lox2hue.0.cache.scenes`).
 - `lib/colorMath.js`: Reine Farbmatrix- und Farbtemperatur-Berechnungen (`rgbToXy`, `rgbToMired`).
 - `lib/commandLogic.js`: Reine Kommandologik ohne ioBroker-Abhängigkeiten (`parseLoxoneRgb`,
   `computeRawCommand`, `commandToClipV2Action`, `commandSignature`, `snapshotFingerprint`).

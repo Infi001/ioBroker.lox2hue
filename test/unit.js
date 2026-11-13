@@ -680,6 +680,10 @@ describe('Loxone2Hue adapter end-to-end (mocked ioBroker + CLIP v2 bridge)', () 
             expect(harness.recorded.foreignStateWrites.at(-1)).to.deep.equal(['hue.0.rgb1.on', false, false]);
 
             await new Promise(resolve => adapter.onUnload(resolve));
+            expect(adapter.ownStates['cache.scenes']?.val).to.be.a('string');
+            expect(JSON.parse(adapter.ownStates['cache.scenes'].val).rooms['loxone.0.roomA']['1'].bridgeSceneId).to.equal(
+                'scene-1',
+            );
         } finally {
             harness.cleanup();
         }

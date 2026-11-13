@@ -14,6 +14,8 @@ const commandLogic = require('./lib/commandLogic');
 const sceneStateMachine = require('./lib/sceneStateMachine');
 
 const CACHE_SCHEMA_VERSION = 2;
+const SCENE_CACHE_ID = 'cache.scenes';
+const LEGACY_SCENE_CACHE_ID = 'cache.szenen';
 const LEGACY_CACHE_ZONE_NAME = 'lox2hue (Cache)';
 const CACHE_ZONE_PREFIX = 'lox2hue: ';
 const RECALL_SUPPRESS_MS = 1500;
@@ -587,11 +589,10 @@ class Loxone2Hue extends utils.Adapter {
     }
 
     async loadSceneCache() {
-        const id = 'cache.szenen';
-        await this.setObjectNotExistsAsync(id, {
+        await this.setObjectNotExistsAsync(SCENE_CACHE_ID, {
             type: 'state',
             common: {
-                name: 'Szenen-Cache (Sollwerte je Raum+Stimmung)',
+                name: 'Scene cache (target values per room and mood)',
                 type: 'string',
                 role: 'json',
                 read: true,
@@ -600,7 +601,19 @@ class Loxone2Hue extends utils.Adapter {
             },
             native: {},
         });
-        const state = await this.getStateAsync(id);
+        let state = await this.getStateAsync(SCENE_CACHE_ID);
+        let migratedFromLegacy = false;
+        if (!state || !state.val || state.val === '{}') {
+            try {
+                const legacyState = await this.getStateAsync(LEGACY_SCENE_CACHE_ID);
+                if (legacyState && legacyState.val && legacyState.val !== '{}') {
+                    state = legacyState;
+                    migratedFromLegacy = true;
+                }
+            } catch {
+                // ignore absent legacy cache state
+            }
+        }
         let needsReset = false;
         try {
             const parsed = JSON.parse((state && state.val) || '{}');
@@ -617,7 +630,10 @@ class Loxone2Hue extends utils.Adapter {
             this.log.info(
                 '[SZENE] Szenen-Cache auf Schema v2 (CLIP v2, bereinigte Lernlogik) zurückgesetzt — Szenen werden sauber neu gelernt.',
             );
-            await this.setStateAsync(id, JSON.stringify(this.sceneCache), true);
+            await this.setStateAsync(SCENE_CACHE_ID, JSON.stringify(this.sceneCache), true);
+        } else if (migratedFromLegacy) {
+            this.log.info(`[SZENE] Szenen-Cache von ${LEGACY_SCENE_CACHE_ID} nach ${SCENE_CACHE_ID} übernommen.`);
+            await this.setStateAsync(SCENE_CACHE_ID, JSON.stringify(this.sceneCache), true);
         }
     }
 
@@ -626,7 +642,7 @@ class Loxone2Hue extends utils.Adapter {
             return;
         }
         this.cacheDirty = false;
-        this.setState('cache.szenen', JSON.stringify(this.sceneCache), true);
+        this.setState(SCENE_CACHE_ID, JSON.stringify(this.sceneCache), true);
     }
 
     saveSceneCacheDebounced() {
