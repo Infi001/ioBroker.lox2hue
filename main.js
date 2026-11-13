@@ -4,68 +4,48 @@
  * ioBroker.lox2hue
  *
  * Mirrors Loxone light-control moods (LightControllerV2) onto Philips Hue lamps.
- * Loxone stays the master: every change on a configured Loxone analog output
- * (.rgb / .position / .active) is forwarded immediately to the assigned Hue lamp.
- *
- * The adapter additionally learns, per room (Loxone light-control block) and mood
- * (activeMoodsNum), the target values of all assigned lamps. Once a mood has
- * "settled" (8s with no further change), the adapter creates its own minimal
- * Philips Hue bridge scene for it. The next time that same mood is triggered, only
- * that one scene is recalled (a single bridge call) instead of N individual
- * commands - this fixes the staggered/sequential switching that plain per-lamp
- * control causes via the bridge/Zigbee processing.
- *
- * Two cases are excluded from caching automatically (detected purely by behavior,
- * not by name):
- *  - Manual mode: Loxone reports activeMoodsNum < 0 whenever no defined mood
- *    matches exactly anymore (e.g. because a lamp was readjusted by hand).
- *  - Dynamic scenes (e.g. "Party"): if a mood doesn't settle within
- *    dynamicGiveUpMs, it's treated as dynamic and permanently excluded.
+ * Learns settled per-room moods and caches them as Philips Hue CLIP v2 scenes
+ * inside a dedicated "lox2hue (Cache)" zone for single-call recall.
  */
 
 const utils = require('@iobroker/adapter-core');
 const https = require('node:https');
 const commandLogic = require('./lib/commandLogic');
+const sceneStateMachine = require('./lib/sceneStateMachine');
 
-/**
- * Human-readable capability label for logs and the admin UI's Loxone-context
- * display. Returns 'Unknown' when detection found no usable capability at all
- * (e.g. a deleted Hue device or a typo'd id) - previously this silently fell
- * through to 'Switch', making a completely broken mapping look like a correctly
- * detected on/off device.
- *
- * @param {object} type Device capabilities as produced by detectDevice()
- * @returns {'RGB'|'Dimmer'|'Switch'|'Unknown'} The detected capability label
- */
-function capabilityLabel(type) {
-    if (type.isRGB) {
-        return 'RGB';
-    }
-    if (type.isDimmer) {
-        return 'Dimmer';
-    }
-    if (type.isSwitch) {
-        return 'Switch';
-    }
-    return 'Unknown';
-}
+const CACHE_SCHEMA_VERSION = 2;
+const LEGACY_CACHE_ZONE_NAME = 'lox2hue (Cache)';
+const CACHE_ZONE_PREFIX = 'lox2hue: ';
+const RECALL_SUPPRESS_MS = 1500;
+const LOXONE_SUFFIX_RE = /\.(rgb|position|active)$/;
+
+const stripLoxoneSuffix = id => id.replace(LOXONE_SUFFIX_RE, '');
+const loxoneRoomKey = loxoneBaseId => loxoneBaseId.substring(0, loxoneBaseId.lastIndexOf('.'));
+const extractRid = items => (items && items[0] && items[0].rid ? items[0].rid : null);
+const capabilityLabel = type => (type.isRGB ? 'RGB' : type.isDimmer ? 'Dimmer' : type.isSwitch ? 'Switch' : 'Unknown');
 
 class Loxone2Hue extends utils.Adapter {
     constructor(options) {
         super({ ...options, name: 'lox2hue' });
 
-        this.deviceCapabilities = {}; // hueId -> { isGroup, cmdPrefix, isRGB, hasCT, isDimmer, isSwitch, loxoneSuffix, fullLoxoneId, bridgeId }
-        this.roomGroups = {}; // roomKey -> { members: [{loxoneId,hueId}], activeMoodsId, currentMoodNum, currentMoodSince, settleTimer }
-        this.sceneCache = {}; // roomKey -> { [moodNum]: { lights: {...}, bridgeSceneId } | { dynamic:true } }
-        this.pendingChanges = new Map(); // hueId -> { loxoneId, hueId, val }
-        this.loxoneToHue = new Map(); // fullLoxoneId -> Array<{ roomKey, hueId }> (multiple lamps per Loxone output are possible)
-        this.activeMoodsToRoom = new Map(); // activeMoodsId -> roomKey
+        this.deviceCapabilities = {};
+        this.roomGroups = {};
+        this.sceneCache = { version: CACHE_SCHEMA_VERSION, rooms: {} };
+        this.pendingChanges = new Map();
+        this.loxoneToHue = new Map();
+        this.activeMoodsToRoom = new Map();
+        this.v2LightsByV1Id = new Map();
+        this.v2ZonesByRoom = new Map(); // roomKey -> { id, lightIds }
         this.debounceTimer = null;
         this.cacheSaveTimer = null;
+        this.cacheDirty = false;
         this.watchdogInterval = null;
-        this.stateExistsCache = new Map(); // id -> boolean, small shortcut for repeated existsState lookups
-        this.lastKnownOn = new Map(); // hueId -> boolean, purely internal (no bridge round-trip) for wasOn()
-        this.bridgeReachable = undefined; // tracked live via hueBridgeRequest()/onReady(), see setBridgeReachable()
+        this.stateExistsCache = new Map();
+        this.lastKnownOn = new Map();
+        this.bridgeReachable = undefined;
+        this.bridgeFailureStreak = 0;
+        this.bridgeQueue = Promise.resolve();
+        this.bridgeAgent = new https.Agent({ keepAlive: true, maxSockets: 2, rejectUnauthorized: false });
 
         this.on('ready', this.onReady.bind(this));
         this.on('stateChange', this.onStateChange.bind(this));
@@ -73,17 +53,18 @@ class Loxone2Hue extends utils.Adapter {
         this.on('unload', this.onUnload.bind(this));
     }
 
-    // ---------------------------------------------------------------
-    // Helpers: state existence/access with a small cache
-    // ---------------------------------------------------------------
-    async stateExists(id) {
-        if (this.stateExistsCache.has(id)) {
-            return this.stateExistsCache.get(id);
+    clearTimer(owner, prop) {
+        if (owner[prop]) {
+            this.clearTimeout(owner[prop]);
+            owner[prop] = null;
         }
-        const obj = await this.getForeignObjectAsync(id);
-        const exists = !!obj;
-        this.stateExistsCache.set(id, exists);
-        return exists;
+    }
+
+    async stateExists(id) {
+        if (!this.stateExistsCache.has(id)) {
+            this.stateExistsCache.set(id, !!(await this.getForeignObjectAsync(id)));
+        }
+        return this.stateExistsCache.get(id);
     }
 
     async getForeignVal(id) {
@@ -92,25 +73,17 @@ class Loxone2Hue extends utils.Adapter {
     }
 
     // ---------------------------------------------------------------
-    // Talk to the Hue bridge directly (bypassing the adapter abstraction) - needed
-    // for scene creation/recall, which iobroker.hue itself cannot do.
+    // Hue Bridge HTTPS client (CLIP v2 primary + legacy v1 cleanup)
     // ---------------------------------------------------------------
     async initHueBridge() {
-        // Bridge IP/port are conveniently taken from the hue adapter's own config
-        // (not protected there), as a default/fallback if not explicitly set on this
-        // adapter instance. The API user/token ("user") is marked as "protectedNative"
-        // on iobroker.hue and therefore CANNOT be read via getForeignObject from
-        // ANOTHER adapter (comes back as undefined, even though the CLI/admin UI shows
-        // it) - it must therefore be entered explicitly in this adapter's own config.
-        let fallbackHost, fallbackPort;
+        let fallbackHost;
+        let fallbackPort;
         try {
-            const hueAdapterObj = await this.getForeignObjectAsync(`system.adapter.${this.config.hueInstance}`);
-            if (hueAdapterObj && hueAdapterObj.native) {
-                fallbackHost = hueAdapterObj.native.bridge;
-                fallbackPort = hueAdapterObj.native.port;
-            }
+            const hueObj = await this.getForeignObjectAsync(`system.adapter.${this.config.hueInstance}`);
+            fallbackHost = hueObj && hueObj.native && hueObj.native.bridge;
+            fallbackPort = hueObj && hueObj.native && hueObj.native.port;
         } catch {
-            /* fine, fall back to just this adapter's own config */
+            /* fall back to own config */
         }
 
         this.hueBridgeHost = this.config.hueBridgeHost || fallbackHost;
@@ -125,22 +98,20 @@ class Loxone2Hue extends utils.Adapter {
         if (!this.hueBridgeUser) {
             throw new Error(
                 `Kein Hue-Bridge-API-Token gesetzt - bitte "Hue-Bridge-API-Token" in der Adapter-Konfiguration eintragen ` +
-                    `(zu finden in der Konfiguration der ${
-                        this.config.hueInstance
-                    }-Instanz, Feld "Nutzer"/"user" - dort geschützt, ` +
-                    `muss hier einmalig manuell eingetragen werden).`,
+                    `(zu finden in der Konfiguration der ${this.config.hueInstance}-Instanz, Feld "Nutzer"/"user").`,
             );
         }
     }
 
-    // ---------------------------------------------------------------
-    // Marks the Hue bridge as (un)reachable, and updates info.connection to reflect
-    // live connectivity rather than just "adapter start-up succeeded" - previously
-    // info.connection was set true once at the end of onReady() and never touched
-    // again, so a bridge that went offline later stayed silently invisible (still
-    // reported as connected) other than error-level log lines.
-    // ---------------------------------------------------------------
-    setBridgeReachable(reachable) {
+    setBridgeReachable(reachable, immediate = false) {
+        if (reachable) {
+            this.bridgeFailureStreak = 0;
+        } else {
+            this.bridgeFailureStreak++;
+            if (!immediate && this.bridgeReachable === true && this.bridgeFailureStreak < 2) {
+                return;
+            }
+        }
         if (this.bridgeReachable === reachable) {
             return;
         }
@@ -153,55 +124,306 @@ class Loxone2Hue extends utils.Adapter {
         }
     }
 
-    hueBridgeRequest(method, path, body) {
-        return new Promise((resolve, reject) => {
-            const data = body ? JSON.stringify(body) : undefined;
-            const req = https.request(
-                {
-                    host: this.hueBridgeHost,
-                    port: this.hueBridgePort,
-                    path: `/api/${this.hueBridgeUser}${path}`,
-                    method: method,
-                    rejectUnauthorized: false,
-                    headers: data
-                        ? {
-                              'Content-Type': 'application/json',
-                              'Content-Length': Buffer.byteLength(data),
-                          }
-                        : {},
-                },
-                res => {
-                    let chunks = '';
-                    res.on('data', c => {
-                        chunks += c;
+    enqueueBridgeRequest(fn) {
+        const run = this.bridgeQueue.then(fn, fn);
+        this.bridgeQueue = run.catch(() => {});
+        return run;
+    }
+
+    rawHttpsJson(method, path, body, useClipV2Header = true) {
+        return this.enqueueBridgeRequest(
+            () =>
+                new Promise((resolve, reject) => {
+                    const data = body !== undefined ? JSON.stringify(body) : undefined;
+                    const headers = {};
+                    if (useClipV2Header) {
+                        headers['hue-application-key'] = this.hueBridgeUser;
+                    }
+                    if (data) {
+                        headers['Content-Type'] = 'application/json';
+                        headers['Content-Length'] = Buffer.byteLength(data);
+                    }
+                    const req = https.request(
+                        {
+                            host: this.hueBridgeHost,
+                            port: this.hueBridgePort,
+                            path,
+                            method,
+                            agent: this.bridgeAgent,
+                            rejectUnauthorized: false,
+                            headers,
+                        },
+                        res => {
+                            let chunks = '';
+                            res.on('data', c => (chunks += c));
+                            res.on('end', () => {
+                                const statusCode = res.statusCode || 0;
+                                this.setBridgeReachable(statusCode < 500);
+                                let parsed = null;
+                                if (chunks) {
+                                    try {
+                                        parsed = JSON.parse(chunks);
+                                    } catch {
+                                        parsed = null;
+                                    }
+                                }
+                                resolve({ statusCode, body: parsed, raw: chunks });
+                            });
+                        },
+                    );
+                    req.on('error', err => {
+                        this.setBridgeReachable(false, true);
+                        reject(err);
                     });
-                    res.on('end', () => {
-                        this.setBridgeReachable(true);
-                        try {
-                            resolve(JSON.parse(chunks));
-                        } catch {
-                            resolve(null);
-                        }
+                    req.setTimeout(8000, () => {
+                        this.setBridgeReachable(false);
+                        req.destroy(new Error('Timeout'));
                     });
-                },
-            );
-            req.on('error', err => {
-                this.setBridgeReachable(false);
-                reject(err);
-            });
-            req.setTimeout(5000, () => {
-                this.setBridgeReachable(false);
-                req.destroy(new Error('Timeout'));
-            });
-            if (data) {
-                req.write(data);
+                    if (data) {
+                        req.write(data);
+                    }
+                    req.end();
+                }),
+        );
+    }
+
+    async clipV2Request(method, resourcePath, body) {
+        const res = await this.rawHttpsJson(method, `/clip/v2${resourcePath}`, body, true);
+        const errors = res.body && Array.isArray(res.body.errors) ? res.body.errors : [];
+        if (res.statusCode < 200 || res.statusCode >= 300 || errors.length > 0) {
+            const msg =
+                errors
+                    .map(e => e.description)
+                    .filter(Boolean)
+                    .join('; ') || `HTTP ${res.statusCode}`;
+            const err = new Error(`CLIP v2 ${method} ${resourcePath}: ${msg}`);
+            err.statusCode = res.statusCode;
+            throw err;
+        }
+        return (res.body && res.body.data) || [];
+    }
+
+    async deleteClipV2SceneSafe(sceneId) {
+        if (!sceneId) {
+            return;
+        }
+        try {
+            await this.clipV2Request('DELETE', `/resource/scene/${sceneId}`);
+        } catch {
+            /* ignore if already gone */
+        }
+    }
+
+    async cleanupLegacyV1Scenes() {
+        try {
+            const res = await this.rawHttpsJson('GET', `/api/${this.hueBridgeUser}/scenes`, undefined, false);
+            if (res.statusCode < 200 || res.statusCode >= 300 || !res.body || typeof res.body !== 'object') {
+                return;
             }
-            req.end();
+            // Only remove legacy CLIP v1 LightScenes ("lx_..."). CLIP v2 scenes appear as "GroupScene".
+            const legacyIds = Object.keys(res.body).filter(id => {
+                const entry = res.body[id];
+                return (
+                    entry &&
+                    entry.type === 'LightScene' &&
+                    typeof entry.name === 'string' &&
+                    entry.name.startsWith('lx_')
+                );
+            });
+            if (legacyIds.length === 0) {
+                return;
+            }
+            let deleted = 0;
+            for (const id of legacyIds) {
+                try {
+                    const delRes = await this.rawHttpsJson(
+                        'DELETE',
+                        `/api/${this.hueBridgeUser}/scenes/${id}`,
+                        undefined,
+                        false,
+                    );
+                    if (delRes.statusCode >= 200 && delRes.statusCode < 300) {
+                        deleted++;
+                    }
+                } catch {
+                    /* ignore individual delete failures */
+                }
+            }
+            this.log.info(`[SZENE] ${deleted} verwaiste Legacy-v1 "lx_"-Szenen auf der Hue-Bridge bereinigt.`);
+        } catch (e) {
+            this.log.warn(`[SZENE] Bereinigung alter v1-Szenen übersprungen: ${e.message}`);
+        }
+    }
+
+    getRoomBridgeLightIds(roomKey) {
+        const room = this.roomGroups[roomKey];
+        if (!room) {
+            return [];
+        }
+        const ids = new Set();
+        for (const member of room.members) {
+            const cap = this.deviceCapabilities[member.hueId];
+            if (!cap || cap.isGroup || !cap.bridgeId || /tradfri/i.test(member.hueId)) {
+                continue;
+            }
+            const v2Light = this.v2LightsByV1Id.get(String(cap.bridgeId));
+            if (v2Light) {
+                ids.add(v2Light.id);
+            }
+        }
+        return Array.from(ids).sort();
+    }
+
+    async ensureRoomV2Zone(roomKey, sortedLightIds, existingZonesByName) {
+        if (sortedLightIds.length === 0) {
+            return null;
+        }
+        const zoneName = sceneStateMachine.buildCacheZoneName(roomKey);
+        const current = this.v2ZonesByRoom.get(roomKey);
+        if (current && JSON.stringify(current.lightIds) === JSON.stringify(sortedLightIds)) {
+            return current.id;
+        }
+
+        const desiredChildren = sortedLightIds.map(rid => ({ rid, rtype: 'light' }));
+        const existingZone =
+            current ||
+            (existingZonesByName
+                ? existingZonesByName.get(zoneName)
+                : (await this.clipV2Request('GET', '/resource/zone')).find(
+                      z => z.metadata && z.metadata.name === zoneName,
+                  ));
+
+        if (existingZone) {
+            const existingIds =
+                existingZone.lightIds ||
+                (existingZone.children || [])
+                    .filter(c => c.rtype === 'light')
+                    .map(c => c.rid)
+                    .sort();
+            if (JSON.stringify(existingIds) !== JSON.stringify(sortedLightIds)) {
+                await this.clipV2Request('PUT', `/resource/zone/${existingZone.id}`, { children: desiredChildren });
+                this.log.info(`[SZENE] CLIP v2 Zone "${zoneName}" aktualisiert (${sortedLightIds.length} Lampen).`);
+            }
+            this.v2ZonesByRoom.set(roomKey, { id: existingZone.id, lightIds: sortedLightIds });
+            return existingZone.id;
+        }
+
+        const created = await this.clipV2Request('POST', '/resource/zone', {
+            type: 'zone',
+            metadata: { name: zoneName, archetype: 'other' },
+            children: desiredChildren,
         });
+        const zoneId = extractRid(created);
+        if (zoneId) {
+            this.v2ZonesByRoom.set(roomKey, { id: zoneId, lightIds: sortedLightIds });
+            this.log.info(`[SZENE] CLIP v2 Zone "${zoneName}" angelegt (${sortedLightIds.length} Lampen).`);
+        }
+        return zoneId;
+    }
+
+    async initClipV2Resources() {
+        const [lights, zones] = await Promise.all([
+            this.clipV2Request('GET', '/resource/light'),
+            this.clipV2Request('GET', '/resource/zone'),
+        ]);
+        this.v2LightsByV1Id.clear();
+        this.v2ZonesByRoom.clear();
+        for (const l of lights) {
+            if (!l.id_v1 || !l.id_v1.startsWith('/lights/')) {
+                continue;
+            }
+            const schema = l.color_temperature && l.color_temperature.mirek_schema;
+            this.v2LightsByV1Id.set(l.id_v1.slice('/lights/'.length), {
+                id: l.id,
+                minDimLevel: l.dimming && typeof l.dimming.min_dim_level === 'number' ? l.dimming.min_dim_level : 0.1,
+                mirekMin: schema && typeof schema.mirek_minimum === 'number' ? schema.mirek_minimum : 153,
+                mirekMax: schema && typeof schema.mirek_maximum === 'number' ? schema.mirek_maximum : 500,
+                hasDimming: !!l.dimming,
+                hasColor: !!l.color,
+                hasCT: !!l.color_temperature,
+            });
+        }
+
+        const zonesByName = new Map();
+        const activeZoneNames = new Set();
+        const minLights = this.config.sceneMinLights ?? 2;
+
+        for (const z of zones) {
+            const name = z.metadata && z.metadata.name;
+            if (typeof name === 'string') {
+                zonesByName.set(name, z);
+            }
+        }
+
+        for (const roomKey of Object.keys(this.roomGroups)) {
+            const lightIds = this.getRoomBridgeLightIds(roomKey);
+            if (lightIds.length >= minLights) {
+                activeZoneNames.add(sceneStateMachine.buildCacheZoneName(roomKey));
+                await this.ensureRoomV2Zone(roomKey, lightIds, zonesByName);
+            }
+        }
+
+        // Clean up deprecated single global cache zone and unused per-room cache zones
+        for (const z of zones) {
+            const name = z.metadata && z.metadata.name;
+            if (
+                name === LEGACY_CACHE_ZONE_NAME ||
+                (typeof name === 'string' && name.startsWith(CACHE_ZONE_PREFIX) && !activeZoneNames.has(name))
+            ) {
+                try {
+                    await this.clipV2Request('DELETE', `/resource/zone/${z.id}`);
+                    this.log.info(`[SZENE] Ungenutzte CLIP v2 Zone "${name}" bereinigt.`);
+                } catch {
+                    /* ignore */
+                }
+            }
+        }
+
+        await this.reconcileV2Scenes();
+    }
+
+    async reconcileV2Scenes() {
+        const v2Scenes = await this.clipV2Request('GET', '/resource/scene');
+        const validSceneIds = new Set(v2Scenes.map(s => s.id));
+        const managedZoneIds = new Set(Array.from(this.v2ZonesByRoom.values()).map(z => z.id));
+        const referencedSceneIds = new Set();
+
+        for (const roomCache of Object.values(this.sceneCache.rooms)) {
+            if (!roomCache || typeof roomCache !== 'object') {
+                continue;
+            }
+            for (const entry of Object.values(roomCache)) {
+                if (!entry || entry.dynamic || !entry.bridgeSceneId) {
+                    continue;
+                }
+                if (validSceneIds.has(entry.bridgeSceneId)) {
+                    referencedSceneIds.add(entry.bridgeSceneId);
+                } else {
+                    delete entry.bridgeSceneId;
+                    this.saveSceneCacheDebounced();
+                }
+            }
+        }
+
+        const orphans = v2Scenes.filter(
+            s =>
+                s.group &&
+                managedZoneIds.has(s.group.rid) &&
+                s.metadata &&
+                typeof s.metadata.name === 'string' &&
+                s.metadata.name.startsWith('lx_') &&
+                !referencedSceneIds.has(s.id),
+        );
+        for (const s of orphans) {
+            await this.deleteClipV2SceneSafe(s.id);
+        }
+        if (orphans.length > 0) {
+            this.log.info(`[SZENE] ${orphans.length} verwaiste CLIP v2 Cache-Szenen bereinigt.`);
+        }
     }
 
     // ---------------------------------------------------------------
-    // Device detection (RGB / Dimmer / Switch, group or single lamp)
+    // Device detection & command execution
     // ---------------------------------------------------------------
     async detectDevice(hueId, loxoneBaseId) {
         if (this.deviceCapabilities[hueId]) {
@@ -211,56 +433,47 @@ class Loxone2Hue extends utils.Adapter {
         const isGroup = await this.stateExists(`${hueId}.action.on`);
         const cmdPrefix = isGroup ? '.action' : '';
 
-        const hasXY =
-            (await this.stateExists(`${hueId + cmdPrefix}.xy`)) || (await this.stateExists(`${hueId + cmdPrefix}.hue`));
-        const hasCT = await this.stateExists(`${hueId + cmdPrefix}.ct`);
-        const hasLevel = await this.stateExists(`${hueId + cmdPrefix}.level`);
-        const hasOn = await this.stateExists(`${hueId + cmdPrefix}.on`);
+        const [hasXyState, hasHueState, hasCT, hasLevel, hasOn, hueObj] = await Promise.all([
+            this.stateExists(`${hueId + cmdPrefix}.xy`),
+            this.stateExists(`${hueId + cmdPrefix}.hue`),
+            this.stateExists(`${hueId + cmdPrefix}.ct`),
+            this.stateExists(`${hueId + cmdPrefix}.level`),
+            this.stateExists(`${hueId + cmdPrefix}.on`),
+            this.getForeignObjectAsync(hueId),
+        ]);
+
+        const isRGB = hasXyState || hasHueState;
+        const isDimmer = hasLevel;
+        let loxoneSuffix = '.active';
+        if (isRGB) {
+            loxoneSuffix = '.rgb';
+        } else if (isDimmer) {
+            const loxObj = loxoneBaseId ? await this.getForeignObjectAsync(loxoneBaseId) : null;
+            const controlType = loxObj && loxObj.native && loxObj.native.control && loxObj.native.control.type;
+            loxoneSuffix = /color/i.test(controlType || '') ? '.rgb' : '.position';
+        }
 
         const type = {
             isGroup,
             cmdPrefix,
-            isRGB: hasXY,
+            isRGB,
             hasCT,
-            isDimmer: hasLevel,
-            isSwitch: hasOn && !hasLevel,
-            loxoneSuffix: '',
-            fullLoxoneId: null,
-            bridgeId: null,
+            isDimmer,
+            isSwitch: hasOn && !isDimmer,
+            loxoneSuffix,
+            fullLoxoneId: loxoneBaseId ? loxoneBaseId + loxoneSuffix : null,
+            bridgeId: (hueObj && hueObj.native && hueObj.native.id) || null,
         };
 
-        if (type.isRGB) {
-            type.loxoneSuffix = '.rgb';
-        } else if (type.isDimmer) {
-            // White-ambiance lamp (no real RGB) - still subscribe to ".rgb" instead of
-            // ".position" WHEN this Loxone output is itself configured as a genuine
-            // color picker (Loxone block type "ColorPickerV2"/"ColorPicker", not
-            // "Dimmer") - then the color intent can be approximated as a color
-            // temperature (see rgbToMired() usage in lib/commandLogic.js). A plain
-            // "Dimmer" block, on the other hand, has no color info at all, so
-            // ".position" remains correct there. User request 28.08.
-            let loxoneIsColorPicker = false;
-            if (loxoneBaseId) {
-                const loxObj = await this.getForeignObjectAsync(loxoneBaseId);
-                const controlType = loxObj && loxObj.native && loxObj.native.control && loxObj.native.control.type;
-                loxoneIsColorPicker = /color/i.test(controlType || '');
-            }
-            type.loxoneSuffix = loxoneIsColorPicker ? '.rgb' : '.position';
-        } else {
-            type.loxoneSuffix = '.active';
-        }
-
-        type.fullLoxoneId = loxoneBaseId ? loxoneBaseId + type.loxoneSuffix : null;
-
-        const hueObj = await this.getForeignObjectAsync(hueId);
-        type.bridgeId = hueObj && hueObj.native && hueObj.native.id;
-
         this.deviceCapabilities[hueId] = type;
+        if (hasOn) {
+            const initOn = await this.getForeignVal(`${hueId + cmdPrefix}.on`);
+            if (typeof initOn === 'boolean') {
+                this.lastKnownOn.set(hueId, initOn);
+            }
+        }
         const label = capabilityLabel(type);
         if (label === 'Unknown') {
-            // None of .on/.level/.xy/.hue exist under this id at all - most likely a
-            // typo'd Hue object id, or a lamp that was since deleted from the bridge.
-            // Without this warning such a mapping fails completely silently.
             this.log.warn(
                 `[${hueId}] keine Fähigkeiten erkannt (.on/.level/.xy/.hue fehlen alle) - Hue-Objekt-ID prüfen, existiert die Lampe noch?`,
             );
@@ -271,39 +484,16 @@ class Loxone2Hue extends utils.Adapter {
         return type;
     }
 
-    // ---------------------------------------------------------------
-    // Checks whether a lamp was on BEFORE this command - used to only apply the
-    // fixed color temperature on the off->on transition, not on every brightness
-    // change while it's already on (otherwise a color temperature chosen manually in
-    // the Hue app would get overwritten on every dim step - user request 28.08., so
-    // the Hue app stays usable for color temperature, the way it was handled before
-    // this adapter existed).
-    //
-    // Deliberately NOT the live Hue state (".on"), but a purely internally tracked
-    // value (lastKnownOn) - the live state can take a very long time (several
-    // minutes, observed on 27./28.08.) to be reported back by the bridge/hue
-    // adapter, which would make it far too unreliable as a basis for this decision.
-    // ---------------------------------------------------------------
-    wasOn(hueId) {
-        return this.lastKnownOn.get(hueId) === true;
-    }
-
-    // ---------------------------------------------------------------
-    // Stateful wrapper around commandLogic.computeRawCommand(): looks up this
-    // device's capabilities/wasOn() state, delegates the actual (pure, unit-tested)
-    // decision to lib/commandLogic.js, then remembers whether the lamp will now be
-    // on or off (for wasOn() on the next call, see above).
-    // ---------------------------------------------------------------
-    async computeCommand(inputVal, hueId) {
+    computeCommandRaw(inputVal, hueId, wasOnOverride) {
         const type = this.deviceCapabilities[hueId];
         if (!type) {
             return null;
         }
-        const cmd = commandLogic.computeRawCommand({
+        return commandLogic.computeRawCommand({
             inputVal,
             type,
             isTradfri: /tradfri/i.test(hueId),
-            wasOn: this.wasOn(hueId),
+            wasOn: typeof wasOnOverride === 'boolean' ? wasOnOverride : this.lastKnownOn.get(hueId) === true,
             config: {
                 offFadeMs: this.config.offFadeMs,
                 onFadeMs: this.config.onFadeMs,
@@ -311,10 +501,6 @@ class Loxone2Hue extends utils.Adapter {
                 forceWarmWhiteMired: this.config.forceWarmWhiteMired,
             },
         });
-        if (cmd) {
-            this.lastKnownOn.set(hueId, !cmd.isOff);
-        }
-        return cmd;
     }
 
     async applyCommand(hueId, prefix, cmd) {
@@ -336,7 +522,10 @@ class Loxone2Hue extends utils.Adapter {
             return;
         }
         try {
-            const cmd = await this.computeCommand(inputVal, hueId);
+            const cmd = this.computeCommandRaw(inputVal, hueId);
+            if (cmd) {
+                this.lastKnownOn.set(hueId, !cmd.isOff);
+            }
             await this.applyCommand(hueId, type.cmdPrefix, cmd);
         } catch (e) {
             this.log.error(`[${hueId}] ${e.message}`);
@@ -344,13 +533,15 @@ class Loxone2Hue extends utils.Adapter {
     }
 
     // ---------------------------------------------------------------
-    // Debounce/batch: process several changes within the same short window together
-    // (in parallel) instead of one after another.
+    // Debounce/batch
     // ---------------------------------------------------------------
     scheduleAction(loxoneId, hueId, val) {
         this.pendingChanges.set(hueId, { loxoneId, hueId, val });
         if (!this.debounceTimer) {
-            this.debounceTimer = this.setTimeout(() => this.executeBatch(), this.config.debounceMs);
+            this.debounceTimer = this.setTimeout(
+                () => this.executeBatch().catch(e => this.log.error(`[BATCH] ${e.message}`)),
+                this.config.debounceMs ?? 200,
+            );
         }
     }
 
@@ -365,52 +556,32 @@ class Loxone2Hue extends utils.Adapter {
     }
 
     // ---------------------------------------------------------------
-    // Converts an internal command (adapter-specific field names such as "level"
-    // 0-100) into a raw Hue bridge lightstate object ("bri" 0-254).
+    // Rooms & CLIP v2 scene cache
     // ---------------------------------------------------------------
-    commandToLightstate(cmd) {
-        if (!cmd || !cmd.writes || !cmd.writes.length) {
+    getOrCreateRoom(roomKey) {
+        if (!this.roomGroups[roomKey]) {
+            this.roomGroups[roomKey] = {
+                members: [],
+                activeMoodsId: undefined,
+                currentMoodNum: undefined,
+                currentMoodSince: Date.now(),
+                burstStartAt: null,
+                burstEvents: 0,
+                lastWaveAt: 0,
+                settleTimer: null,
+                recalledMoodNum: null,
+                recalledUntil: 0,
+            };
+        }
+        return this.roomGroups[roomKey];
+    }
+
+    getCachedMood(roomKey, moodNum) {
+        if (!sceneStateMachine.isValidStaticMood(moodNum)) {
             return null;
         }
-        const cmdWrite = cmd.writes.find(w => w.suffix === '.command');
-        if (cmdWrite) {
-            let parsed;
-            try {
-                parsed = JSON.parse(cmdWrite.value);
-            } catch {
-                return null;
-            }
-            const state = {
-                on: !!parsed.on,
-                transitiontime: parsed.transitiontime || 0,
-            };
-            if (typeof parsed.level === 'number') {
-                state.bri = Math.max(1, Math.round(parsed.level * 2.54));
-            }
-            if (parsed.xy) {
-                state.xy = parsed.xy;
-            }
-            if (parsed.ct) {
-                state.ct = parsed.ct;
-            }
-            return state;
-        }
-        const onWrite = cmd.writes.find(w => w.suffix === '.on');
-        if (onWrite) {
-            return { on: !!onWrite.value };
-        }
-        return null; // e.g. Tradfri (separate .level/.ct writes) - not scene-capable
-    }
-
-    // ---------------------------------------------------------------
-    // Rooms / scene cache
-    // ---------------------------------------------------------------
-    loxoneRoomKey(loxoneBaseId) {
-        return loxoneBaseId.substring(0, loxoneBaseId.lastIndexOf('.'));
-    }
-
-    isManualMode(moodNum) {
-        return Number(moodNum) < 0;
+        const roomCache = this.sceneCache.rooms[roomKey];
+        return roomCache ? roomCache[sceneStateMachine.normalizeMoodKey(moodNum)] || null : null;
     }
 
     async loadSceneCache() {
@@ -428,37 +599,41 @@ class Loxone2Hue extends utils.Adapter {
             native: {},
         });
         const state = await this.getStateAsync(id);
+        let needsReset = false;
         try {
-            this.sceneCache = JSON.parse((state && state.val) || '{}');
+            const parsed = JSON.parse((state && state.val) || '{}');
+            if (parsed && parsed.version === CACHE_SCHEMA_VERSION && parsed.rooms && typeof parsed.rooms === 'object') {
+                this.sceneCache = parsed;
+            } else {
+                needsReset = !!(parsed && Object.keys(parsed).length > 0);
+                this.sceneCache = { version: CACHE_SCHEMA_VERSION, rooms: {} };
+            }
         } catch {
-            this.sceneCache = {};
+            this.sceneCache = { version: CACHE_SCHEMA_VERSION, rooms: {} };
         }
+        if (needsReset) {
+            this.log.info(
+                '[SZENE] Szenen-Cache auf Schema v2 (CLIP v2, bereinigte Lernlogik) zurückgesetzt — Szenen werden sauber neu gelernt.',
+            );
+            await this.setStateAsync(id, JSON.stringify(this.sceneCache), true);
+        }
+    }
+
+    flushDirtySceneCache() {
+        if (!this.cacheDirty) {
+            return;
+        }
+        this.cacheDirty = false;
+        this.setState('cache.szenen', JSON.stringify(this.sceneCache), true);
     }
 
     saveSceneCacheDebounced() {
-        if (this.cacheSaveTimer) {
-            this.clearTimeout(this.cacheSaveTimer);
-        }
+        this.cacheDirty = true;
+        this.clearTimer(this, 'cacheSaveTimer');
         this.cacheSaveTimer = this.setTimeout(() => {
-            this.setState('cache.szenen', JSON.stringify(this.sceneCache), true);
+            this.cacheSaveTimer = null;
+            this.flushDirtySceneCache();
         }, 2000);
-    }
-
-    markDynamic(roomKey, moodNum) {
-        if (!this.sceneCache[roomKey]) {
-            this.sceneCache[roomKey] = {};
-        }
-        const previous = this.sceneCache[roomKey][moodNum];
-        if (previous && previous.bridgeSceneId) {
-            this.hueBridgeRequest('DELETE', `/scenes/${previous.bridgeSceneId}`).catch(() => {});
-        }
-        this.sceneCache[roomKey][moodNum] = { dynamic: true };
-        this.saveSceneCacheDebounced();
-        this.log.info(
-            `[SZENE] ${roomKey} Mood ${moodNum} kommt seit über ${
-                this.config.dynamicGiveUpMs / 1000
-            }s nicht zur Ruhe -> als dynamisch markiert.`,
-        );
     }
 
     scheduleSettleCheck(roomKey) {
@@ -466,239 +641,308 @@ class Loxone2Hue extends utils.Adapter {
         if (!room || !room.activeMoodsId) {
             return;
         }
-        if (
-            room.currentMoodNum !== undefined &&
-            room.currentMoodSince &&
-            Date.now() - room.currentMoodSince > this.config.dynamicGiveUpMs
-        ) {
-            this.markDynamic(roomKey, String(room.currentMoodNum));
-            if (room.settleTimer) {
-                this.clearTimeout(room.settleTimer);
-                room.settleTimer = null;
-            }
-            return;
-        }
-        if (room.settleTimer) {
-            this.clearTimeout(room.settleTimer);
-        }
-        room.settleTimer = this.setTimeout(() => this.snapshotRoom(roomKey), this.config.settleMs);
+        this.clearTimer(room, 'settleTimer');
+        room.settleTimer = this.setTimeout(
+            () => this.snapshotRoom(roomKey).catch(e => this.log.error(`[SZENE] ${e.message}`)),
+            this.config.settleMs ?? 8000,
+        );
     }
 
-    async updateBridgeScene(roomKey, moodNum, snap) {
-        const lightIds = [];
-        const states = {};
+    async markDynamic(roomKey, moodKey) {
+        const roomCache = (this.sceneCache.rooms[roomKey] ||= {});
+        const existing = roomCache[moodKey];
+        if (existing && existing.dynamic) {
+            return;
+        }
+        if (existing) {
+            await this.deleteClipV2SceneSafe(existing.bridgeSceneId);
+        }
+        roomCache[moodKey] = { dynamic: true };
+        this.saveSceneCacheDebounced();
+        this.log.info(
+            `[SZENE] ${roomKey} Mood ${moodKey} ändert sich dauerhaft (> ${
+                (this.config.dynamicGiveUpMs ?? 30000) / 1000
+            }s ohne Pause) -> als dynamisch markiert.`,
+        );
+    }
+
+    buildClipV2Actions(snap) {
+        const actions = [];
         for (const hueId of Object.keys(snap)) {
             const type = this.deviceCapabilities[hueId];
-            if (!type || !type.bridgeId) {
-                continue;
+            const v2Light = type && !type.isGroup && type.bridgeId && this.v2LightsByV1Id.get(String(type.bridgeId));
+            const action = v2Light && commandLogic.commandToClipV2Action(snap[hueId], v2Light);
+            if (action) {
+                actions.push({ target: { rid: v2Light.id, rtype: 'light' }, action });
             }
-            const state = this.commandToLightstate(snap[hueId]);
-            if (!state) {
-                continue;
-            }
-            lightIds.push(type.bridgeId);
-            states[type.bridgeId] = state;
         }
-        if (lightIds.length < this.config.sceneMinLights) {
+        return actions;
+    }
+
+    async upsertBridgeScene(roomKey, moodKey, snap, existingEntry) {
+        const actions = this.buildClipV2Actions(snap);
+        if (actions.length < (this.config.sceneMinLights ?? 2)) {
+            if (existingEntry) {
+                await this.deleteClipV2SceneSafe(existingEntry.bridgeSceneId);
+            }
             return null;
         }
 
-        const previousSceneId =
-            this.sceneCache[roomKey] &&
-            this.sceneCache[roomKey][moodNum] &&
-            this.sceneCache[roomKey][moodNum].bridgeSceneId;
-        if (previousSceneId) {
+        const actionLightIds = actions.map(a => a.target.rid).sort();
+        const zoneId = await this.ensureRoomV2Zone(roomKey, actionLightIds);
+        if (!zoneId) {
+            return null;
+        }
+
+        const sceneName = sceneStateMachine.buildBridgeSceneName(roomKey, moodKey);
+        if (existingEntry && existingEntry.bridgeSceneId) {
             try {
-                await this.hueBridgeRequest('DELETE', `/scenes/${previousSceneId}`);
-            } catch {
-                /* fine */
+                await this.clipV2Request('PUT', `/resource/scene/${existingEntry.bridgeSceneId}`, {
+                    metadata: { name: sceneName },
+                    actions,
+                });
+                this.log.info(
+                    `[SZENE] CLIP v2 Bridge-Szene für ${roomKey}/${moodKey} aktualisiert (${existingEntry.bridgeSceneId}, ${actions.length} Lampen).`,
+                );
+                return existingEntry.bridgeSceneId;
+            } catch (e) {
+                this.log.debug(
+                    `[SZENE] In-place-Update für ${existingEntry.bridgeSceneId} fehlgeschlagen (${e.message}), lege neu an.`,
+                );
             }
         }
+
         try {
-            const created = await this.hueBridgeRequest('POST', '/scenes', {
-                name: `lx_${roomKey.slice(-8)}_${moodNum}`,
-                lights: lightIds,
-                recycle: true,
+            const created = await this.clipV2Request('POST', '/resource/scene', {
+                type: 'scene',
+                metadata: { name: sceneName },
+                group: { rid: zoneId, rtype: 'zone' },
+                auto_dynamic: false,
+                actions,
             });
-            const sceneId = created && created[0] && created[0].success && created[0].success.id;
+            const sceneId = extractRid(created);
             if (!sceneId) {
-                this.log.error(
-                    `[SZENE] Bridge-Szene für ${roomKey}/${moodNum} nicht angelegt: ${JSON.stringify(created)}`,
-                );
+                this.log.error(`[SZENE] CLIP v2 Bridge-Szene für ${roomKey}/${moodKey} lieferte keine ID.`);
                 return null;
             }
-            for (const bId of lightIds) {
-                await this.hueBridgeRequest('PUT', `/scenes/${sceneId}/lightstates/${bId}`, states[bId]);
-            }
             this.log.info(
-                `[SZENE] Bridge-Szene für ${roomKey}/${moodNum} angelegt (${sceneId}, ${lightIds.length} Lampen).`,
+                `[SZENE] CLIP v2 Bridge-Szene für ${roomKey}/${moodKey} angelegt (${sceneId}, ${actions.length} Lampen).`,
             );
             return sceneId;
         } catch (e) {
-            this.log.error(`[SZENE] Bridge-Szene für ${roomKey}/${moodNum} fehlgeschlagen: ${e.message}`);
+            // If POST timed out after bridge creation, recover existing scene by name in zone
+            try {
+                const v2Scenes = await this.clipV2Request('GET', '/resource/scene');
+                const existing = v2Scenes.find(
+                    s => s.group && s.group.rid === zoneId && s.metadata && s.metadata.name === sceneName,
+                );
+                if (existing) {
+                    await this.clipV2Request('PUT', `/resource/scene/${existing.id}`, { actions });
+                    this.log.info(
+                        `[SZENE] CLIP v2 Bridge-Szene für ${roomKey}/${moodKey} nach Lookup übernommen (${existing.id}, ${actions.length} Lampen).`,
+                    );
+                    return existing.id;
+                }
+            } catch {
+                /* keep original error below */
+            }
+            this.log.error(`[SZENE] CLIP v2 Bridge-Szene für ${roomKey}/${moodKey} fehlgeschlagen: ${e.message}`);
             return null;
         }
     }
 
     async snapshotRoom(roomKey) {
         const room = this.roomGroups[roomKey];
-        if (!room || !room.activeMoodsId || !(await this.stateExists(room.activeMoodsId))) {
+        if (!room) {
             return;
         }
-        const moodNum = String(await this.getForeignVal(room.activeMoodsId));
-        if (this.isManualMode(moodNum)) {
-            this.log.debug(`[SZENE] ${roomKey} Mood ${moodNum} = manueller Modus -> wird nicht gecacht.`);
+        sceneStateMachine.markSettled(room);
+        room.settleTimer = null;
+
+        if (!room.activeMoodsId || !(await this.stateExists(room.activeMoodsId))) {
             return;
         }
+        const rawMood = await this.getForeignVal(room.activeMoodsId);
+        if (!sceneStateMachine.isValidStaticMood(rawMood)) {
+            this.log.debug(`[SZENE] ${roomKey} Mood ${rawMood} = nicht statisch -> wird nicht gecacht.`);
+            return;
+        }
+        const moodKey = sceneStateMachine.normalizeMoodKey(rawMood);
+        room.currentMoodNum = moodKey;
+
+        const existingEntry = this.sceneCache.rooms[roomKey] && this.sceneCache.rooms[roomKey][moodKey];
+        if (existingEntry && existingEntry.dynamic) {
+            return;
+        }
+
         const snap = {};
-        for (const member of room.members) {
-            const type = this.deviceCapabilities[member.hueId];
-            if (!type || !type.fullLoxoneId || !(await this.stateExists(type.fullLoxoneId))) {
-                continue;
-            }
-            const val = await this.getForeignVal(type.fullLoxoneId);
-            const cmd = await this.computeCommand(val, member.hueId);
-            if (cmd) {
-                snap[member.hueId] = cmd;
-            }
+        await Promise.all(
+            room.members.map(async member => {
+                const type = this.deviceCapabilities[member.hueId];
+                if (!type || !type.fullLoxoneId || !(await this.stateExists(type.fullLoxoneId))) {
+                    return;
+                }
+                const val = await this.getForeignVal(type.fullLoxoneId);
+                // Deterministic snapshot with wasOn=false so CT defaults persist across transitions
+                const cmd = this.computeCommandRaw(val, member.hueId, false);
+                if (cmd) {
+                    snap[member.hueId] = cmd;
+                }
+            }),
+        );
+
+        const fingerprint = commandLogic.snapshotFingerprint(snap);
+        const needsBridgeScene = this.buildClipV2Actions(snap).length >= (this.config.sceneMinLights ?? 2);
+
+        if (
+            existingEntry &&
+            existingEntry.fingerprint === fingerprint &&
+            (!needsBridgeScene || existingEntry.bridgeSceneId)
+        ) {
+            this.log.debug(`[SZENE] ${roomKey} Mood ${moodKey} unverändert -> Bridge-Szene bleibt bestehen.`);
+            return;
         }
-        const bridgeSceneId = await this.updateBridgeScene(roomKey, moodNum, snap);
-        if (!this.sceneCache[roomKey]) {
-            this.sceneCache[roomKey] = {};
-        }
-        this.sceneCache[roomKey][moodNum] = {
+
+        const bridgeSceneId = await this.upsertBridgeScene(roomKey, moodKey, snap, existingEntry);
+        (this.sceneCache.rooms[roomKey] ||= {})[moodKey] = {
             lights: snap,
+            fingerprint,
             bridgeSceneId: bridgeSceneId || undefined,
         };
         this.saveSceneCacheDebounced();
         this.log.info(
-            `[SZENE] ${roomKey} Mood ${moodNum} eingeschwungen, ${Object.keys(snap).length} Lampen gespeichert${
-                bridgeSceneId ? ` (+ Bridge-Szene ${bridgeSceneId})` : ''
+            `[SZENE] ${roomKey} Mood ${moodKey} eingeschwungen, ${Object.keys(snap).length} Lampen gespeichert${
+                bridgeSceneId ? ` (+ CLIP v2 Szene ${bridgeSceneId})` : ''
             }.`,
         );
     }
 
     async applyIndividually(lightsMap) {
-        for (const hueId of Object.keys(lightsMap)) {
-            const type = this.deviceCapabilities[hueId];
-            if (type) {
-                await this.applyCommand(hueId, type.cmdPrefix, lightsMap[hueId]);
-            }
-        }
+        await Promise.all(
+            Object.entries(lightsMap).map(async ([hueId, cmd]) => {
+                const type = this.deviceCapabilities[hueId];
+                if (!type || !cmd) {
+                    return;
+                }
+                this.lastKnownOn.set(hueId, !cmd.isOff);
+                await this.applyCommand(hueId, type.cmdPrefix, cmd);
+            }),
+        );
     }
 
-    async applySceneImmediately(roomKey, moodNum) {
-        if (this.isManualMode(moodNum)) {
-            this.log.debug(`[SZENE] ${roomKey} Mood ${moodNum} = manueller Modus -> normaler Ablauf.`);
-            return;
-        }
-        const entry = this.sceneCache[roomKey] && this.sceneCache[roomKey][String(moodNum)];
-        if (entry && entry.dynamic) {
-            this.log.debug(`[SZENE] ${roomKey} Mood ${moodNum} ist dynamisch -> normaler Ablauf.`);
-            return;
-        }
+    async applySceneImmediately(roomKey, moodNum, now) {
+        const entry = this.getCachedMood(roomKey, moodNum);
         if (!entry) {
-            this.log.debug(`[SZENE] ${roomKey} Mood ${moodNum} noch nicht bekannt -> normaler Ablauf.`);
             return;
         }
-        const lightsMap = entry.lights || entry;
-        if (entry.bridgeSceneId) {
-            this.log.info(
-                `[SZENE] ${roomKey} Mood ${moodNum} bekannt -> Bridge-Szene ${
-                    entry.bridgeSceneId
-                } abrufen (1 Aufruf statt ${Object.keys(lightsMap).length}).`,
-            );
-            try {
-                await this.hueBridgeRequest('PUT', '/groups/0/action', {
-                    scene: entry.bridgeSceneId,
-                });
-            } catch (e) {
-                this.log.warn(
-                    `[SZENE] Bridge-Szenen-Abruf fehlgeschlagen (${e.message}) -> Einzelbefehle als Rückfall.`,
-                );
-                await this.applyIndividually(lightsMap);
+        const moodKey = sceneStateMachine.normalizeMoodKey(moodNum);
+        if (entry.dynamic) {
+            this.log.debug(`[SZENE] ${roomKey} Mood ${moodKey} ist dynamisch -> normaler Ablauf.`);
+            return;
+        }
+        if (!entry.bridgeSceneId) {
+            return;
+        }
+
+        const room = this.roomGroups[roomKey];
+        const lightsMap = entry.lights || {};
+
+        for (const member of room.members) {
+            const pending = this.pendingChanges.get(member.hueId);
+            const expected = pending && lightsMap[member.hueId];
+            if (!expected) {
+                continue;
             }
-            return;
+            const pendingCmd = this.computeCommandRaw(pending.val, member.hueId, false);
+            if (pendingCmd && commandLogic.commandSignature(pendingCmd) === commandLogic.commandSignature(expected)) {
+                this.pendingChanges.delete(member.hueId);
+            }
         }
-        this.log.debug(
-            `[SZENE] ${roomKey} Mood ${moodNum} bekannt -> ${
-                Object.keys(lightsMap).length
-            } Lampen einzeln sofort setzen.`,
+        room.recalledMoodNum = moodKey;
+        room.recalledUntil = now + RECALL_SUPPRESS_MS;
+
+        const lightEntries = Object.entries(lightsMap);
+        for (const [hueId, cmd] of lightEntries) {
+            this.lastKnownOn.set(hueId, !cmd.isOff);
+        }
+
+        const allOff = lightEntries.length > 0 && lightEntries.every(([, cmd]) => cmd.isOff);
+        const duration = allOff ? (this.config.offFadeMs ?? 700) : (this.config.onFadeMs ?? 700);
+
+        this.log.info(
+            `[SZENE] ${roomKey} Mood ${moodKey} bekannt -> CLIP v2 Szene ${entry.bridgeSceneId} abrufen (1 Aufruf statt ${lightEntries.length}, duration ${duration}ms).`,
         );
-        await this.applyIndividually(lightsMap);
+        try {
+            await this.clipV2Request('PUT', `/resource/scene/${entry.bridgeSceneId}`, {
+                recall: { action: 'active', duration },
+            });
+            await Promise.all(
+                lightEntries
+                    .filter(([, cmd]) => cmd && cmd.groupable === false)
+                    .map(([hueId, cmd]) => {
+                        const type = this.deviceCapabilities[hueId];
+                        return type ? this.applyCommand(hueId, type.cmdPrefix, cmd) : null;
+                    }),
+            );
+        } catch (e) {
+            this.log.warn(`[SZENE] CLIP v2 Szenen-Abruf fehlgeschlagen (${e.message}) -> Einzelbefehle als Rückfall.`);
+            if (e.statusCode === 404) {
+                delete entry.bridgeSceneId;
+                this.saveSceneCacheDebounced();
+            }
+            await this.applyIndividually(lightsMap);
+        }
     }
 
     // ---------------------------------------------------------------
-    // Off watchdog: periodically checks whether lamps that should be off according
-    // to Loxone actually are (and re-sends failed commands).
+    // Off watchdog
     // ---------------------------------------------------------------
     async checkAndCorrectOff() {
         let checked = 0;
         let corrected = 0;
-        for (const roomKey of Object.keys(this.roomGroups)) {
-            for (const member of this.roomGroups[roomKey].members) {
-                const type = this.deviceCapabilities[member.hueId];
-                if (!type || !type.fullLoxoneId || !(await this.stateExists(type.fullLoxoneId))) {
-                    continue;
-                }
+        const members = Object.values(this.roomGroups).flatMap(r => r.members);
 
-                const loxoneVal = await this.getForeignVal(type.fullLoxoneId);
-                const cmd = await this.computeCommand(loxoneVal, member.hueId);
-                if (!cmd || !cmd.isOff) {
-                    continue;
+        await Promise.all(
+            members.map(async ({ hueId }) => {
+                try {
+                    const type = this.deviceCapabilities[hueId];
+                    if (!type || !type.fullLoxoneId || !(await this.stateExists(type.fullLoxoneId))) {
+                        return;
+                    }
+                    const cmd = this.computeCommandRaw(await this.getForeignVal(type.fullLoxoneId), hueId);
+                    const onStateId = `${hueId + type.cmdPrefix}.on`;
+                    if (!cmd || !cmd.isOff || !(await this.stateExists(onStateId))) {
+                        return;
+                    }
+                    checked++;
+                    if ((await this.getForeignVal(onStateId)) !== true) {
+                        return;
+                    }
+                    corrected++;
+                    this.lastKnownOn.set(hueId, false);
+                    const reachableId = `${hueId}.reachable`;
+                    const reachable = (await this.stateExists(reachableId))
+                        ? await this.getForeignVal(reachableId)
+                        : null;
+                    this.log.info(
+                        `[WÄCHTER] ${hueId} sollte aus sein, ist aber noch an${
+                            reachable === false ? ' (nicht erreichbar!)' : ''
+                        } -> sende Aus erneut.`,
+                    );
+                    await this.applyCommand(hueId, type.cmdPrefix, cmd);
+                } catch (e) {
+                    this.log.warn(`[WÄCHTER] ${hueId}: ${e.message}`);
                 }
+            }),
+        );
 
-                const onStateId = `${member.hueId + type.cmdPrefix}.on`;
-                if (!(await this.stateExists(onStateId))) {
-                    continue;
-                }
-                checked++;
-
-                const isOn = (await this.getForeignVal(onStateId)) === true;
-                if (!isOn) {
-                    continue;
-                }
-
-                corrected++;
-                const reachableId = `${member.hueId}.reachable`;
-                const reachable = (await this.stateExists(reachableId)) ? await this.getForeignVal(reachableId) : null;
-                this.log.info(
-                    `[WÄCHTER] ${member.hueId} sollte aus sein, ist aber noch an${
-                        reachable === false ? ' (nicht erreichbar!)' : ''
-                    } -> sende Aus erneut.`,
-                );
-                await this.applyCommand(member.hueId, type.cmdPrefix, cmd);
-            }
-        }
         if (corrected > 0) {
             this.log.info(`[WÄCHTER] ${corrected} von ${checked} geprüften "Aus"-Lampen mussten korrigiert werden.`);
         }
     }
 
     // ---------------------------------------------------------------
-    // (Re)builds the "Loxone context" display field (format "Group::Loxone name
-    // (Type X)") for all devices and writes it back into the configuration if it
-    // changed. Called both on adapter start and manually via the "Refresh Loxone
-    // context" button (admin UI, sendTo).
-    //
-    // "Group" no longer has its own input field in the admin UI as of 28.08. (to
-    // keep the table at three columns instead of four) - the user edits it directly
-    // in the first segment (before the first "::") of this context text. "::"
-    // (instead of a plain ":") so it's distinguishable from a single ":" that can
-    // appear in Loxone's own name (e.g. "Lichtsteuerung Terrasse: Gartenbeet 1").
-    // That's why this does NOT simply rebuild from the old "group" field (which
-    // would discard any manual edit) - instead the group is parsed back out of the
-    // *current* loxoneInfo text, and only the rest (Loxone name, type) is
-    // refreshed. Falls back to the old "group" field for legacy entries without a
-    // loxoneInfo text yet (initial migration).
-    //
-    // @param devices Device array (mutated in place)
-    // @param onlyKnownDevices true = only consider already-detected devices
-    //   (this.deviceCapabilities) (on adapter start, subscribeForeignStatesAsync for
-    //   new devices is running in parallel anyway); false = also look up not-yet-known
-    //   devices live via detectDevice() (for the manual button, so freshly saved but
-    //   not-yet-restarted rows also work, without having to restart the whole adapter)
-    // @returns {changed, total}
+    // Admin UI Loxone context helper
     // ---------------------------------------------------------------
     async updateLoxoneContext(devices, onlyKnownDevices) {
         let changed = 0;
@@ -709,28 +953,22 @@ class Loxone2Hue extends utils.Adapter {
                     return;
                 }
                 total++;
-                const normalizedLoxoneId = d.loxoneId.replace(/\.(rgb|position|active)$/, '');
+                const baseLoxoneId = stripLoxoneSuffix(d.loxoneId);
                 let type = this.deviceCapabilities[d.hueId];
                 if (!type && !onlyKnownDevices) {
                     try {
-                        type = await this.detectDevice(d.hueId, normalizedLoxoneId);
+                        type = await this.detectDevice(d.hueId, baseLoxoneId);
                     } catch {
-                        /* Hue device possibly unreachable right now */
+                        /* Hue device possibly unreachable */
                     }
                 }
                 if (!type) {
                     return;
                 }
-                const loxObj = await this.getForeignObjectAsync(normalizedLoxoneId);
-                const loxoneName = (loxObj && loxObj.common && loxObj.common.name) || normalizedLoxoneId;
-                const typeName = capabilityLabel(type);
-                // Only trust the value as "Group::Name (Type X)" if it actually looks
-                // like it (marker "::") - otherwise the value might just have come
-                // fresh from fillOnSelect (raw Loxone name without a group prefix,
-                // user just picked a new Loxone output) and would be wrongly
-                // interpreted as the group.
+                const loxObj = await this.getForeignObjectAsync(baseLoxoneId);
+                const loxoneName = (loxObj && loxObj.common && loxObj.common.name) || baseLoxoneId;
                 const group = d.loxoneInfo && d.loxoneInfo.includes('::') ? d.loxoneInfo.split('::')[0] : d.group || '';
-                const newContext = `${group}::${loxoneName} (Type ${typeName})`;
+                const newContext = `${group}::${loxoneName} (Type ${capabilityLabel(type)})`;
                 if (d.loxoneInfo !== newContext) {
                     d.loxoneInfo = newContext;
                     changed++;
@@ -738,53 +976,44 @@ class Loxone2Hue extends utils.Adapter {
             }),
         );
         if (changed > 0) {
-            await this.extendForeignObjectAsync(`system.adapter.${this.namespace}`, {
-                native: { devices },
-            });
-            this.log.debug(`[KONTEXT] ${changed} von ${total} Eintraegen aktualisiert.`);
+            await this.extendForeignObjectAsync(`system.adapter.${this.namespace}`, { native: { devices } });
+            this.log.debug(`[KONTEXT] ${changed} von ${total} Einträgen aktualisiert.`);
         }
         return { changed, total };
     }
 
-    // ---------------------------------------------------------------
-    // Messages from the admin UI ("Refresh Loxone context" sendTo button). Reads
-    // the configuration FRESH from the objects DB (not this.config, which is only
-    // the frozen snapshot from the last adapter start) - this way the button also
-    // works on changes that were just saved, with no restart needed.
-    // ---------------------------------------------------------------
     async onMessage(obj) {
-        if (obj.command === 'refreshLoxoneContext') {
-            try {
-                const selfObj = await this.getForeignObjectAsync(`system.adapter.${this.namespace}`);
-                const devices = (selfObj && selfObj.native && selfObj.native.devices) || [];
-                const result = await this.updateLoxoneContext(devices, false);
-                if (obj.callback) {
-                    this.sendTo(
-                        obj.from,
-                        obj.command,
-                        {
-                            native: { devices },
-                            message: `${result.changed} von ${result.total} Einträgen aktualisiert.`,
-                        },
-                        obj.callback,
-                    );
-                }
-            } catch (e) {
-                this.log.error(`[refreshLoxoneContext] ${e.message}`);
-                if (obj.callback) {
-                    this.sendTo(obj.from, obj.command, { error: e.message }, obj.callback);
-                }
+        if (obj.command !== 'refreshLoxoneContext') {
+            return;
+        }
+        try {
+            const selfObj = await this.getForeignObjectAsync(`system.adapter.${this.namespace}`);
+            const devices = (selfObj && selfObj.native && selfObj.native.devices) || [];
+            const result = await this.updateLoxoneContext(devices, false);
+            if (obj.callback) {
+                this.sendTo(
+                    obj.from,
+                    obj.command,
+                    { native: { devices }, message: `${result.changed} von ${result.total} Einträgen aktualisiert.` },
+                    obj.callback,
+                );
+            }
+        } catch (e) {
+            this.log.error(`[refreshLoxoneContext] ${e.message}`);
+            if (obj.callback) {
+                this.sendTo(obj.from, obj.command, { error: e.message }, obj.callback);
             }
         }
     }
 
     // ---------------------------------------------------------------
-    // Start
+    // Startup, events & shutdown
     // ---------------------------------------------------------------
     async onReady() {
         this.setState('info.connection', false, true);
 
-        if (!this.config.devices || !this.config.devices.length) {
+        const rawDevices = this.config.devices || [];
+        if (!rawDevices.length) {
             this.log.warn(
                 'Keine Geräte konfiguriert - bitte in der Adapter-Konfiguration die Loxone→Hue-Zuordnung eintragen.',
             );
@@ -798,52 +1027,15 @@ class Loxone2Hue extends utils.Adapter {
         }
         await this.loadSceneCache();
 
-        // Lamps (tab "Lamps") and zones (tab "Zones", names+order only) are two
-        // independent, flat lists - a lamp is moved between zones simply by setting
-        // its "group" field to a different zone name. The rest of the code doesn't
-        // know about zones at all, only Loxone room grouping (loxoneRoomKey).
-        // Normalize the Loxone id: the object-selection dialog often returns the
-        // full state (e.g. loxone.0.<uuid>.AI9.rgb), while the rest of the code
-        // works with the base id without a .rgb/.position/.active suffix (the
-        // suffix is re-appended anyway depending on the detected lamp type) - both
-        // input forms therefore work equally well.
-        const devices = (this.config.devices || [])
+        const devices = rawDevices
             .filter(d => d.loxoneId && d.hueId)
-            .map(d => ({
-                ...d,
-                loxoneId: d.loxoneId.replace(/\.(rgb|position|active)$/, ''),
-            }));
+            .map(d => ({ ...d, loxoneId: stripLoxoneSuffix(d.loxoneId) }));
 
-        // Group into rooms
-        for (const d of devices) {
-            const roomKey = this.loxoneRoomKey(d.loxoneId);
-            if (!this.roomGroups[roomKey]) {
-                this.roomGroups[roomKey] = {
-                    members: [],
-                    activeMoodsId: undefined,
-                    currentMoodNum: undefined,
-                    currentMoodSince: undefined,
-                    settleTimer: null,
-                };
-            }
-            this.roomGroups[roomKey].members.push(d);
-        }
-
-        // Detect devices + subscribe to Loxone changes. Processed concurrently
-        // (Promise.all) rather than one device at a time, since each device's
-        // detection/subscription is independent - this keeps start-up time roughly
-        // constant instead of growing linearly with the number of configured lamps.
-        //
-        // IMPORTANT: several Hue lamps can hang off the same Loxone output (e.g. two
-        // identical ceiling lamps on one shared analog output) - loxoneToHue must
-        // therefore hold a LIST of targets per Loxone id, not just a single target
-        // (otherwise the second lamp would simply overwrite the first one during
-        // setup, and the first would then never receive another command - bug found
-        // 28.08. on the bathroom ceiling lamps).
         await Promise.all(
             devices.map(async d => {
+                const roomKey = loxoneRoomKey(d.loxoneId);
+                this.getOrCreateRoom(roomKey).members.push(d);
                 const type = await this.detectDevice(d.hueId, d.loxoneId);
-                const roomKey = this.loxoneRoomKey(d.loxoneId);
                 if (!this.loxoneToHue.has(type.fullLoxoneId)) {
                     this.loxoneToHue.set(type.fullLoxoneId, []);
                 }
@@ -852,75 +1044,132 @@ class Loxone2Hue extends utils.Adapter {
             }),
         );
 
-        // Keep the "Loxone context" display field in the admin UI up to date (see
-        // updateLoxoneContext() above for details/reasoning).
-        await this.updateLoxoneContext(this.config.devices || [], true);
+        await this.updateLoxoneContext(rawDevices, true);
 
-        // Per room: subscribe to activeMoodsNum, if present (light-control block)
-        for (const roomKey of Object.keys(this.roomGroups)) {
-            const activeMoodsId = `${roomKey}.activeMoodsNum`;
-            if (await this.stateExists(activeMoodsId)) {
-                const room = this.roomGroups[roomKey];
+        try {
+            await this.cleanupLegacyV1Scenes();
+            await this.initClipV2Resources();
+        } catch (e) {
+            this.log.error(`[SZENE] CLIP v2 Initialisierung fehlgeschlagen: ${e.message}`);
+        }
+
+        await Promise.all(
+            Object.entries(this.roomGroups).map(async ([roomKey, room]) => {
+                const activeMoodsId = `${roomKey}.activeMoodsNum`;
+                if (!(await this.stateExists(activeMoodsId))) {
+                    return;
+                }
                 room.activeMoodsId = activeMoodsId;
-                room.currentMoodNum = await this.getForeignVal(activeMoodsId);
+                room.currentMoodNum = sceneStateMachine.formatMoodState(await this.getForeignVal(activeMoodsId));
                 room.currentMoodSince = Date.now();
                 this.activeMoodsToRoom.set(activeMoodsId, roomKey);
                 await this.subscribeForeignStatesAsync(activeMoodsId);
-                this.log.info(
-                    `[SZENE] ${roomKey}: Lichtsteuerungsbaustein erkannt, ${
-                        this.roomGroups[roomKey].members.length
-                    } Lampen.`,
-                );
-            }
-        }
-
-        this.watchdogInterval = this.setInterval(
-            () => this.checkAndCorrectOff(),
-            this.config.watchdogIntervalMin * 60000,
+                this.log.info(`[SZENE] ${roomKey}: Lichtsteuerungsbaustein erkannt, ${room.members.length} Lampen.`);
+            }),
         );
 
+        const watchdogMin = this.config.watchdogIntervalMin ?? 5;
+        if (watchdogMin > 0) {
+            this.watchdogInterval = this.setInterval(
+                () => this.checkAndCorrectOff().catch(e => this.log.warn(`[WÄCHTER] ${e.message}`)),
+                watchdogMin * 60000,
+            );
+        }
+
         this.setBridgeReachable(true);
-        this.log.info(`lox2hue bereit: ${devices.length} Geräte in ${Object.keys(this.roomGroups).length} Räumen.`);
+        this.log.info(
+            `lox2hue bereit (CLIP v2): ${devices.length} Geräte in ${Object.keys(this.roomGroups).length} Räumen.`,
+        );
+    }
+
+    onMoodStateChange(roomKey, val, now) {
+        const room = this.roomGroups[roomKey];
+        this.clearTimer(room, 'settleTimer');
+        const res = sceneStateMachine.handleMoodChange(room, val, now);
+        if (!res.isStatic) {
+            return;
+        }
+        const cachedEntry = this.getCachedMood(roomKey, res.moodKey);
+        this.applySceneImmediately(roomKey, res.moodKey, now).catch(e => this.log.error(e.message));
+        if (!cachedEntry || !cachedEntry.dynamic) {
+            this.scheduleSettleCheck(roomKey);
+        }
+    }
+
+    onDeviceStateChange(id, val, now) {
+        const targets = this.loxoneToHue.get(id);
+        if (!targets) {
+            return;
+        }
+        const touchedRooms = new Set();
+        for (const target of targets) {
+            const room = this.roomGroups[target.roomKey];
+            const cachedEntry = room ? this.getCachedMood(target.roomKey, room.currentMoodNum) : null;
+            const incomingCmd = this.computeCommandRaw(val, target.hueId, false);
+            if (
+                sceneStateMachine.shouldSuppressEcho({
+                    room,
+                    hueId: target.hueId,
+                    incomingCmd,
+                    cachedEntry,
+                    now,
+                    commandSignatureFn: commandLogic.commandSignature,
+                })
+            ) {
+                if (incomingCmd) {
+                    this.lastKnownOn.set(target.hueId, !incomingCmd.isOff);
+                }
+                continue;
+            }
+            this.scheduleAction(id, target.hueId, val);
+            touchedRooms.add(target.roomKey);
+        }
+
+        for (const rk of touchedRooms) {
+            const room = this.roomGroups[rk];
+            const cachedEntry = room ? this.getCachedMood(rk, room.currentMoodNum) : null;
+            if (!room || (cachedEntry && cachedEntry.dynamic)) {
+                continue;
+            }
+            const res = sceneStateMachine.handleLampChange(room, now, {
+                dynamicGiveUpMs: this.config.dynamicGiveUpMs ?? 30000,
+            });
+            if (res.isDynamic && res.moodKey) {
+                this.clearTimer(room, 'settleTimer');
+                this.markDynamic(rk, res.moodKey).catch(e => this.log.error(e.message));
+            } else if (res.scheduleSettle) {
+                this.scheduleSettleCheck(rk);
+            }
+        }
     }
 
     onStateChange(id, state) {
         if (!state) {
             return;
         }
-
+        const now = Date.now();
         const roomKey = this.activeMoodsToRoom.get(id);
         if (roomKey) {
-            const room = this.roomGroups[roomKey];
-            room.currentMoodNum = state.val;
-            room.currentMoodSince = Date.now();
-            this.applySceneImmediately(roomKey, state.val).catch(e => this.log.error(e.message));
-            return;
-        }
-
-        const targets = this.loxoneToHue.get(id);
-        if (targets) {
-            for (const target of targets) {
-                this.scheduleAction(id, target.hueId, state.val);
-                this.scheduleSettleCheck(target.roomKey);
-            }
+            this.onMoodStateChange(roomKey, state.val, now);
+        } else {
+            this.onDeviceStateChange(id, state.val, now);
         }
     }
 
     onUnload(callback) {
         try {
-            if (this.debounceTimer) {
-                this.clearTimeout(this.debounceTimer);
-            }
-            if (this.cacheSaveTimer) {
-                this.clearTimeout(this.cacheSaveTimer);
-            }
+            this.clearTimer(this, 'debounceTimer');
+            this.clearTimer(this, 'cacheSaveTimer');
+            this.flushDirtySceneCache();
             if (this.watchdogInterval) {
                 this.clearInterval(this.watchdogInterval);
+                this.watchdogInterval = null;
             }
-            for (const roomKey of Object.keys(this.roomGroups)) {
-                if (this.roomGroups[roomKey].settleTimer) {
-                    this.clearTimeout(this.roomGroups[roomKey].settleTimer);
-                }
+            for (const room of Object.values(this.roomGroups)) {
+                this.clearTimer(room, 'settleTimer');
+            }
+            if (this.bridgeAgent) {
+                this.bridgeAgent.destroy();
             }
             callback();
         } catch {

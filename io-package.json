@@ -97,7 +97,7 @@
     "dynamicGiveUpMs": 30000,
     "sceneMinLights": 3,
     "forceWarmWhiteMired": 454,
-    "rgbBrightnessFactor": 0.4,
+    "rgbBrightnessFactor": 1,
     "devices": []
   },
   "objects": [],

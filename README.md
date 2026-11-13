@@ -10,7 +10,7 @@ Mirrors Loxone light-control moods (LightControllerV2) onto Philips Hue lamps. L
 
 Loxone handles automation (switches, moods, schedules); Hue handles the bulbs (color, tunable white). Normally these don't talk to each other. This adapter connects them: Loxone stays fully in charge, Hue just becomes the lamp that shows the result.
 
-Switching many Hue lamps one command at a time makes them turn on visibly one after another — the bridge processes commands serially. A real Hue scene, by contrast, is a Zigbee broadcast: all lamps switch at once. So the adapter learns each room's Loxone mood and, once it has "settled" (a few seconds without further change), caches it as a hidden Hue bridge scene — the next trigger needs one bridge call instead of N.
+Switching many Hue lamps one command at a time makes them turn on visibly one after another — the bridge processes commands serially. A real Hue scene, by contrast, is a Zigbee broadcast: all lamps switch at once. So the adapter learns each room's Loxone mood and, once it has "settled" (a few seconds without further change), caches it as a CLIP v2 Hue bridge scene inside a dedicated per-block cache zone (`lox2hue: ...`) — the next trigger recalls that scene in one bridge call with the configured fade duration instead of N individual requests.
 
 Two cases are excluded from caching automatically:
 
@@ -55,8 +55,8 @@ Once accepted into the official ioBroker adapter catalog, install it from **Admi
 ## Known limitations
 
 - Not yet an official ioBroker adapter catalog entry.
-- Talks to the Hue bridge directly (bypassing `iobroker.hue`), since that adapter doesn't support scene management.
-- Tested against Hue bridge API v1 (`apiversion` 1.78.0).
+- Talks to the Hue bridge directly via the CLIP v2 REST API (`/clip/v2/resource/...`), bypassing `iobroker.hue`, since that adapter doesn't support scene creation/updates.
+- Tested against Hue bridge API v2 (`apiversion` 1.78.0, `swversion` 1978074000).
 - RGB→color-temperature approximation (McCamy's formula) is not exact — saturated colors are clamped to a plausible range.
 
 ## Changelog
