@@ -569,6 +569,8 @@ describe('Loxone2Hue adapter end-to-end (mocked ioBroker + CLIP v2 bridge)', () 
                     respObj = { data: [{ rid: sid, rtype: 'scene' }], errors: [] };
                 } else if (opts.path.startsWith('/clip/v2/resource/scene/') && opts.method === 'PUT') {
                     respObj = { data: [{ rid: opts.path.split('/').pop(), rtype: 'scene' }], errors: [] };
+                } else if (opts.path.startsWith('/clip/v2/resource/light/') && opts.method === 'PUT') {
+                    respObj = { data: [{ rid: opts.path.split('/').pop(), rtype: 'light' }], errors: [] };
                 }
 
                 const res = new EventEmitter();
@@ -656,11 +658,26 @@ describe('Loxone2Hue adapter end-to-end (mocked ioBroker + CLIP v2 bridge)', () 
 
             expect(adapter.sceneCache.rooms['loxone.0.roomA']['2'].bridgeSceneId).to.equal('scene-recovered');
 
-            // Off watchdog corrects drifted-on RGB lamp
+            // Off watchdog skips rooms inside the 15s polling grace window, then corrects via CLIP v2 direct light PUT
             harness.foreignStates['loxone.0.roomA.AI1.rgb'].val = '0,0,0';
             harness.foreignStates['hue.0.rgb1.on'].val = true;
             await adapter.checkAndCorrectOff();
-            expect(harness.recorded.foreignStateWrites.at(-1)[0]).to.equal('hue.0.rgb1.command');
+            expect(
+                harness.recorded.httpCalls.filter(c => c.method === 'PUT' && c.path === '/clip/v2/resource/light/v2-l1'),
+            ).to.have.lengthOf(0);
+
+            adapter.roomGroups['loxone.0.roomA'].lastTransitionAt = Date.now() - 20000;
+            await adapter.checkAndCorrectOff();
+            const lightOffCalls = harness.recorded.httpCalls.filter(
+                c => c.method === 'PUT' && c.path === '/clip/v2/resource/light/v2-l1',
+            );
+            expect(lightOffCalls).to.have.lengthOf(1);
+            expect(lightOffCalls[0].body).to.deep.equal({ on: { on: false } });
+
+            // Watchdog falls back to writing `<hueId>.on = false` when no CLIP v2 light entry exists
+            adapter.v2LightsByV1Id.delete('1');
+            await adapter.checkAndCorrectOff();
+            expect(harness.recorded.foreignStateWrites.at(-1)).to.deep.equal(['hue.0.rgb1.on', false, false]);
 
             await new Promise(resolve => adapter.onUnload(resolve));
         } finally {

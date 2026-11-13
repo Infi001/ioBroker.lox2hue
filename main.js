@@ -17,6 +17,7 @@ const CACHE_SCHEMA_VERSION = 2;
 const LEGACY_CACHE_ZONE_NAME = 'lox2hue (Cache)';
 const CACHE_ZONE_PREFIX = 'lox2hue: ';
 const RECALL_SUPPRESS_MS = 1500;
+const WATCHDOG_GRACE_MS = 15000;
 const LOXONE_SUFFIX_RE = /\.(rgb|position|active)$/;
 
 const stripLoxoneSuffix = id => id.replace(LOXONE_SUFFIX_RE, '');
@@ -571,6 +572,7 @@ class Loxone2Hue extends utils.Adapter {
                 settleTimer: null,
                 recalledMoodNum: null,
                 recalledUntil: 0,
+                lastTransitionAt: 0,
             };
         }
         return this.roomGroups[roomKey];
@@ -897,10 +899,31 @@ class Loxone2Hue extends utils.Adapter {
     // ---------------------------------------------------------------
     // Off watchdog
     // ---------------------------------------------------------------
+    async forceTurnOffDevice(hueId, type, cmd) {
+        const v2Light = !type.isGroup && type.bridgeId && this.v2LightsByV1Id.get(String(type.bridgeId));
+        if (v2Light) {
+            try {
+                await this.clipV2Request('PUT', `/resource/light/${v2Light.id}`, { on: { on: false } });
+                return;
+            } catch (e) {
+                this.log.warn(`[WÄCHTER] CLIP v2 Aus für ${hueId} fehlgeschlagen (${e.message}), nutze Fallback.`);
+            }
+        }
+        const onStateId = `${hueId + type.cmdPrefix}.on`;
+        if (await this.stateExists(onStateId)) {
+            await this.setForeignStateAsync(onStateId, false, false);
+            return;
+        }
+        await this.applyCommand(hueId, type.cmdPrefix, cmd);
+    }
+
     async checkAndCorrectOff() {
         let checked = 0;
         let corrected = 0;
-        const members = Object.values(this.roomGroups).flatMap(r => r.members);
+        const now = Date.now();
+        const members = Object.values(this.roomGroups)
+            .filter(r => !r.lastTransitionAt || now - r.lastTransitionAt >= WATCHDOG_GRACE_MS)
+            .flatMap(r => r.members);
 
         await Promise.all(
             members.map(async ({ hueId }) => {
@@ -929,7 +952,7 @@ class Loxone2Hue extends utils.Adapter {
                             reachable === false ? ' (nicht erreichbar!)' : ''
                         } -> sende Aus erneut.`,
                     );
-                    await this.applyCommand(hueId, type.cmdPrefix, cmd);
+                    await this.forceTurnOffDevice(hueId, type, cmd);
                 } catch (e) {
                     this.log.warn(`[WÄCHTER] ${hueId}: ${e.message}`);
                 }
@@ -1084,6 +1107,7 @@ class Loxone2Hue extends utils.Adapter {
 
     onMoodStateChange(roomKey, val, now) {
         const room = this.roomGroups[roomKey];
+        room.lastTransitionAt = now;
         this.clearTimer(room, 'settleTimer');
         const res = sceneStateMachine.handleMoodChange(room, val, now);
         if (!res.isStatic) {
@@ -1127,6 +1151,9 @@ class Loxone2Hue extends utils.Adapter {
 
         for (const rk of touchedRooms) {
             const room = this.roomGroups[rk];
+            if (room) {
+                room.lastTransitionAt = now;
+            }
             const cachedEntry = room ? this.getCachedMood(rk, room.currentMoodNum) : null;
             if (!room || (cachedEntry && cachedEntry.dynamic)) {
                 continue;
