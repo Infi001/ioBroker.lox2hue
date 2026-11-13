@@ -93,7 +93,7 @@
     "watchdogIntervalMin": 5,
     "onFadeMs": 700,
     "offFadeMs": 700,
-    "settleMs": 8000,
+    "settleMs": 4000,
     "dynamicGiveUpMs": 30000,
     "sceneMinLights": 3,
     "forceWarmWhiteMired": 454,

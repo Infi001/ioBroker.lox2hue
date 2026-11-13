@@ -646,7 +646,7 @@ class Loxone2Hue extends utils.Adapter {
         this.clearTimer(room, 'settleTimer');
         room.settleTimer = this.setTimeout(
             () => this.snapshotRoom(roomKey).catch(e => this.log.error(`[SZENE] ${e.message}`)),
-            this.config.settleMs ?? 8000,
+            this.config.settleMs ?? 4000,
         );
     }
 

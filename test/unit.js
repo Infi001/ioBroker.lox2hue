@@ -454,7 +454,7 @@ describe('Loxone2Hue adapter end-to-end (mocked ioBroker + CLIP v2 bridge)', () 
                     watchdogIntervalMin: 5,
                     onFadeMs: 700,
                     offFadeMs: 0,
-                    settleMs: 8000,
+                    settleMs: 4000,
                     dynamicGiveUpMs: 30000,
                     sceneMinLights: 2,
                     forceWarmWhiteMired: 454,
