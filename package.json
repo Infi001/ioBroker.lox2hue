@@ -1,7 +1,7 @@
 {
   "name": "iobroker.lox2hue",
   "version": "0.1.0",
-  "description": "Spiegelt Loxone-Lichtsteuerungs-Stimmungen auf Philips-Hue-Lampen, mit Szenen-Cache pro Raum für nahezu gleichzeitiges Schalten.",
+  "description": "Mirrors Loxone LightControllerV2 moods onto Philips Hue lamps with per-room Bridge scene caching for near-simultaneous switching.",
   "author": "f.herold@gmail.com",
   "license": "MIT",
   "homepage": "https://github.com/Infi001/ioBroker.lox2hue",
@@ -42,7 +42,9 @@
     "lib/",
     "io-package.json",
     "main.js",
-    "LICENSE"
+    "LICENSE",
+    "README.md",
+    "CHANGELOG_OLD.md"
   ],
   "scripts": {
     "test:package": "mocha test/package --exit",

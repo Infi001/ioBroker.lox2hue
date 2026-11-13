@@ -95,7 +95,7 @@
     "offFadeMs": 700,
     "settleMs": 4000,
     "dynamicGiveUpMs": 30000,
-    "sceneMinLights": 3,
+    "sceneMinLights": 2,
     "forceWarmWhiteMired": 454,
     "rgbBrightnessFactor": 1,
     "devices": []

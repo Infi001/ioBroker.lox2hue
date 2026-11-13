@@ -5,7 +5,7 @@
  *
  * Mirrors Loxone light-control moods (LightControllerV2) onto Philips Hue lamps.
  * Learns settled per-room moods and caches them as Philips Hue CLIP v2 scenes
- * inside a dedicated "lox2hue (Cache)" zone for single-call recall.
+ * inside dedicated per-block "lox2hue: <block>" zones for single-call recall.
  */
 
 const utils = require('@iobroker/adapter-core');
@@ -47,6 +47,9 @@ class Loxone2Hue extends utils.Adapter {
         this.lastKnownOn = new Map();
         this.bridgeReachable = undefined;
         this.bridgeFailureStreak = 0;
+        this.v2Initialized = false;
+        this.v2InitPromise = null;
+        this.delayedWriteTimers = new Map();
         this.bridgeQueue = Promise.resolve();
         this.bridgeAgent = new https.Agent({ keepAlive: true, maxSockets: 2, rejectUnauthorized: false });
 
@@ -73,6 +76,13 @@ class Loxone2Hue extends utils.Adapter {
     async getForeignVal(id) {
         const s = await this.getForeignStateAsync(id);
         return s ? s.val : undefined;
+    }
+
+    async getForeignValCached(cache, id) {
+        if (!cache.has(id)) {
+            cache.set(id, await this.getForeignVal(id));
+        }
+        return cache.get(id);
     }
 
     // ---------------------------------------------------------------
@@ -175,11 +185,10 @@ class Loxone2Hue extends utils.Adapter {
                         },
                     );
                     req.on('error', err => {
-                        this.setBridgeReachable(false, true);
+                        this.setBridgeReachable(false);
                         reject(err);
                     });
                     req.setTimeout(8000, () => {
-                        this.setBridgeReachable(false);
                         req.destroy(new Error('Timeout'));
                     });
                     if (data) {
@@ -385,6 +394,30 @@ class Loxone2Hue extends utils.Adapter {
         await this.reconcileV2Scenes();
     }
 
+    async ensureClipV2Ready(runLegacyCleanup = false) {
+        if (this.v2Initialized) {
+            return true;
+        }
+        if (!this.v2InitPromise) {
+            this.v2InitPromise = (async () => {
+                try {
+                    if (runLegacyCleanup) {
+                        await this.cleanupLegacyV1Scenes();
+                    }
+                    await this.initClipV2Resources();
+                    this.v2Initialized = true;
+                    return true;
+                } catch (e) {
+                    this.log.error(`[SZENE] CLIP v2 Initialisierung fehlgeschlagen: ${e.message}`);
+                    return false;
+                } finally {
+                    this.v2InitPromise = null;
+                }
+            })();
+        }
+        return this.v2InitPromise;
+    }
+
     async reconcileV2Scenes() {
         const v2Scenes = await this.clipV2Request('GET', '/resource/scene');
         const validSceneIds = new Set(v2Scenes.map(s => s.id));
@@ -428,7 +461,7 @@ class Loxone2Hue extends utils.Adapter {
     // ---------------------------------------------------------------
     // Device detection & command execution
     // ---------------------------------------------------------------
-    async detectDevice(hueId, loxoneBaseId) {
+    async detectDevice(hueId, loxoneBaseId, loxObjCache) {
         if (this.deviceCapabilities[hueId]) {
             return this.deviceCapabilities[hueId];
         }
@@ -451,7 +484,17 @@ class Loxone2Hue extends utils.Adapter {
         if (isRGB) {
             loxoneSuffix = '.rgb';
         } else if (isDimmer) {
-            const loxObj = loxoneBaseId ? await this.getForeignObjectAsync(loxoneBaseId) : null;
+            let loxObj = null;
+            if (loxoneBaseId) {
+                if (loxObjCache && loxObjCache.has(loxoneBaseId)) {
+                    loxObj = loxObjCache.get(loxoneBaseId);
+                } else {
+                    loxObj = await this.getForeignObjectAsync(loxoneBaseId);
+                    if (loxObjCache) {
+                        loxObjCache.set(loxoneBaseId, loxObj);
+                    }
+                }
+            }
             const controlType = loxObj && loxObj.native && loxObj.native.control && loxObj.native.control.type;
             loxoneSuffix = /color/i.test(controlType || '') ? '.rgb' : '.position';
         }
@@ -506,13 +549,26 @@ class Loxone2Hue extends utils.Adapter {
         });
     }
 
+    clearDelayedWrite(hueId) {
+        const existing = this.delayedWriteTimers.get(hueId);
+        if (existing) {
+            this.clearTimeout(existing);
+            this.delayedWriteTimers.delete(hueId);
+        }
+    }
+
     async applyCommand(hueId, prefix, cmd) {
         if (!cmd) {
             return;
         }
+        this.clearDelayedWrite(hueId);
         for (const w of cmd.writes) {
             if (w.delayMs) {
-                this.setTimeout(() => this.setForeignStateAsync(hueId + prefix + w.suffix, w.value, false), w.delayMs);
+                const timer = this.setTimeout(() => {
+                    this.delayedWriteTimers.delete(hueId);
+                    this.setForeignStateAsync(hueId + prefix + w.suffix, w.value, false);
+                }, w.delayMs);
+                this.delayedWriteTimers.set(hueId, timer);
             } else {
                 await this.setForeignStateAsync(hueId + prefix + w.suffix, w.value, false);
             }
@@ -698,6 +754,9 @@ class Loxone2Hue extends utils.Adapter {
     }
 
     async upsertBridgeScene(roomKey, moodKey, snap, existingEntry) {
+        if (!(await this.ensureClipV2Ready())) {
+            return null;
+        }
         const actions = this.buildClipV2Actions(snap);
         if (actions.length < (this.config.sceneMinLights ?? 2)) {
             if (existingEntry) {
@@ -706,7 +765,15 @@ class Loxone2Hue extends utils.Adapter {
             return null;
         }
 
+        const expectedLightIds = this.getRoomBridgeLightIds(roomKey);
         const actionLightIds = actions.map(a => a.target.rid).sort();
+        if (expectedLightIds.length > actionLightIds.length) {
+            this.log.warn(
+                `[SZENE] ${roomKey}/${moodKey}: Teil-Snapshot (${actionLightIds.length}/${expectedLightIds.length} Lampen) -> überspringe Bridge-Szene.`,
+            );
+            return existingEntry ? existingEntry.bridgeSceneId || null : null;
+        }
+
         const zoneId = await this.ensureRoomV2Zone(roomKey, actionLightIds);
         if (!zoneId) {
             return null;
@@ -794,13 +861,14 @@ class Loxone2Hue extends utils.Adapter {
         }
 
         const snap = {};
+        const loxValCache = new Map();
         await Promise.all(
             room.members.map(async member => {
                 const type = this.deviceCapabilities[member.hueId];
                 if (!type || !type.fullLoxoneId || !(await this.stateExists(type.fullLoxoneId))) {
                     return;
                 }
-                const val = await this.getForeignVal(type.fullLoxoneId);
+                const val = await this.getForeignValCached(loxValCache, type.fullLoxoneId);
                 // Deterministic snapshot with wasOn=false so CT defaults persist across transitions
                 const cmd = this.computeCommandRaw(val, member.hueId, false);
                 if (cmd) {
@@ -809,6 +877,7 @@ class Loxone2Hue extends utils.Adapter {
             }),
         );
 
+        await this.ensureClipV2Ready();
         const fingerprint = commandLogic.snapshotFingerprint(snap);
         const needsBridgeScene = this.buildClipV2Actions(snap).length >= (this.config.sceneMinLights ?? 2);
 
@@ -941,6 +1010,11 @@ class Loxone2Hue extends utils.Adapter {
             .filter(r => !r.lastTransitionAt || now - r.lastTransitionAt >= WATCHDOG_GRACE_MS)
             .flatMap(r => r.members);
 
+        if (members.length > 0 && !this.v2Initialized) {
+            await this.ensureClipV2Ready();
+        }
+
+        const loxValCache = new Map();
         await Promise.all(
             members.map(async ({ hueId }) => {
                 try {
@@ -948,7 +1022,8 @@ class Loxone2Hue extends utils.Adapter {
                     if (!type || !type.fullLoxoneId || !(await this.stateExists(type.fullLoxoneId))) {
                         return;
                     }
-                    const cmd = this.computeCommandRaw(await this.getForeignVal(type.fullLoxoneId), hueId);
+                    const loxVal = await this.getForeignValCached(loxValCache, type.fullLoxoneId);
+                    const cmd = this.computeCommandRaw(loxVal, hueId);
                     const onStateId = `${hueId + type.cmdPrefix}.on`;
                     if (!cmd || !cmd.isOff || !(await this.stateExists(onStateId))) {
                         return;
@@ -1070,11 +1145,12 @@ class Loxone2Hue extends utils.Adapter {
             .filter(d => d.loxoneId && d.hueId)
             .map(d => ({ ...d, loxoneId: stripLoxoneSuffix(d.loxoneId) }));
 
+        const loxObjCache = new Map();
         await Promise.all(
             devices.map(async d => {
                 const roomKey = loxoneRoomKey(d.loxoneId);
                 this.getOrCreateRoom(roomKey).members.push(d);
-                const type = await this.detectDevice(d.hueId, d.loxoneId);
+                const type = await this.detectDevice(d.hueId, d.loxoneId, loxObjCache);
                 if (!this.loxoneToHue.has(type.fullLoxoneId)) {
                     this.loxoneToHue.set(type.fullLoxoneId, []);
                 }
@@ -1085,12 +1161,7 @@ class Loxone2Hue extends utils.Adapter {
 
         await this.updateLoxoneContext(rawDevices, true);
 
-        try {
-            await this.cleanupLegacyV1Scenes();
-            await this.initClipV2Resources();
-        } catch (e) {
-            this.log.error(`[SZENE] CLIP v2 Initialisierung fehlgeschlagen: ${e.message}`);
-        }
+        await this.ensureClipV2Ready(true);
 
         await Promise.all(
             Object.entries(this.roomGroups).map(async ([roomKey, room]) => {
@@ -1115,7 +1186,9 @@ class Loxone2Hue extends utils.Adapter {
             );
         }
 
-        this.setBridgeReachable(true);
+        if (this.v2Initialized) {
+            this.setBridgeReachable(true);
+        }
         this.log.info(
             `lox2hue bereit (CLIP v2): ${devices.length} Geräte in ${Object.keys(this.roomGroups).length} Räumen.`,
         );
@@ -1208,6 +1281,10 @@ class Loxone2Hue extends utils.Adapter {
                 this.clearInterval(this.watchdogInterval);
                 this.watchdogInterval = null;
             }
+            for (const timer of this.delayedWriteTimers.values()) {
+                this.clearTimeout(timer);
+            }
+            this.delayedWriteTimers.clear();
             for (const room of Object.values(this.roomGroups)) {
                 this.clearTimer(room, 'settleTimer');
             }

@@ -394,7 +394,7 @@ describe('Loxone2Hue adapter end-to-end (mocked ioBroker + CLIP v2 bridge)', () 
     const https = require('node:https');
     const Module = require('node:module');
 
-    function createMockHarness() {
+    function createMockHarness(harnessOpts = {}) {
         const origLoad = Module._load;
         const origHttpsRequest = https.request;
 
@@ -465,7 +465,7 @@ describe('Loxone2Hue adapter end-to-end (mocked ioBroker + CLIP v2 bridge)', () 
                         { loxoneId: 'loxone.0.roomA.AI3', hueId: 'hue.0.plug3', group: 'Raum A' },
                     ],
                 };
-                this.ownStates = {};
+                this.ownStates = { ...(harnessOpts.initialOwnStates || {}) };
                 this.log = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
             }
             setTimeout(fn, ms) {
@@ -506,7 +506,8 @@ describe('Loxone2Hue adapter end-to-end (mocked ioBroker + CLIP v2 bridge)', () 
         }
 
         let failNextScenePost = false;
-        const createdScenes = [];
+        let failV2LightGet = !!harnessOpts.failV2LightGet;
+        const createdScenes = [...(harnessOpts.initialScenes || [])];
 
         https.request = (opts, cb) => {
             const req = new EventEmitter();
@@ -527,6 +528,10 @@ describe('Loxone2Hue adapter end-to-end (mocked ioBroker + CLIP v2 bridge)', () 
                 } else if (opts.path.includes('/scenes/old1')) {
                     respObj = [{ success: 'deleted' }];
                 } else if (opts.path === '/clip/v2/resource/light') {
+                    if (failV2LightGet) {
+                        req.emit('error', new Error('Bridge offline'));
+                        return;
+                    }
                     respObj = {
                         data: [
                             {
@@ -594,6 +599,9 @@ describe('Loxone2Hue adapter end-to-end (mocked ioBroker + CLIP v2 bridge)', () 
             recorded,
             setFailNextScenePost(v) {
                 failNextScenePost = v;
+            },
+            setFailV2LightGet(v) {
+                failV2LightGet = v;
             },
             cleanup() {
                 https.request = origHttpsRequest;
@@ -684,6 +692,81 @@ describe('Loxone2Hue adapter end-to-end (mocked ioBroker + CLIP v2 bridge)', () 
             expect(JSON.parse(adapter.ownStates['cache.scenes'].val).rooms['loxone.0.roomA']['1'].bridgeSceneId).to.equal(
                 'scene-1',
             );
+        } finally {
+            harness.cleanup();
+        }
+    });
+
+    it('migrates legacy cache.szenen to cache.scenes and marks dynamic scenes by deleting bridge scene', async () => {
+        const legacyPayload = JSON.stringify({
+            version: 2,
+            rooms: {
+                'loxone.0.roomA': {
+                    9: { lights: {}, fingerprint: 'fp9', bridgeSceneId: 'scene-dyn' },
+                },
+            },
+        });
+        const harness = createMockHarness({
+            initialOwnStates: { 'cache.szenen': { val: legacyPayload, ack: true } },
+            initialScenes: [{ id: 'scene-dyn', metadata: { name: 'lx_roomA_9' }, group: { rid: 'zone-1' } }],
+        });
+        try {
+            delete require.cache[require.resolve('../main.js')];
+            const adapter = require('../main.js')();
+            await adapter.onReady();
+
+            expect(adapter.sceneCache.rooms['loxone.0.roomA']['9'].bridgeSceneId).to.equal('scene-dyn');
+            expect(adapter.ownStates['cache.scenes']?.val).to.equal(legacyPayload);
+
+            await adapter.markDynamic('loxone.0.roomA', '9');
+            const deleteCalls = harness.recorded.httpCalls.filter(
+                c => c.method === 'DELETE' && c.path === '/clip/v2/resource/scene/scene-dyn',
+            );
+            expect(deleteCalls).to.have.lengthOf(1);
+            expect(adapter.sceneCache.rooms['loxone.0.roomA']['9']).to.deep.equal({ dynamic: true });
+
+            await new Promise(resolve => adapter.onUnload(resolve));
+        } finally {
+            harness.cleanup();
+        }
+    });
+
+    it('recovers CLIP v2 resources lazily after startup failure and cancels stale delayed writes', async () => {
+        const harness = createMockHarness({ failV2LightGet: true });
+        try {
+            delete require.cache[require.resolve('../main.js')];
+            const adapter = require('../main.js')();
+            await adapter.onReady();
+
+            expect(adapter.v2Initialized).to.be.false;
+            expect(adapter.v2LightsByV1Id.size).to.equal(0);
+
+            // Bridge comes back online -> watchdog lazily recovers CLIP v2 resources before turning lamp off
+            harness.setFailV2LightGet(false);
+            harness.foreignStates['hue.0.rgb1.on'].val = true;
+            await adapter.checkAndCorrectOff();
+            expect(adapter.v2Initialized).to.be.true;
+            expect(
+                harness.recorded.httpCalls.filter(c => c.method === 'PUT' && c.path === '/clip/v2/resource/light/v2-l1'),
+            ).to.have.lengthOf(1);
+
+            // Delayed Tradfri .ct write must be cancelled if lamp receives a new command immediately
+            const writesBefore = harness.recorded.foreignStateWrites.length;
+            const onPromise = adapter.applyCommand('hue.0.Tradfri_test', '', {
+                writes: [
+                    { suffix: '.level', value: 70 },
+                    { suffix: '.ct', value: 2200, delayMs: 800 },
+                ],
+            });
+            await onPromise;
+            await adapter.applyCommand('hue.0.Tradfri_test', '', { writes: [{ suffix: '.on', value: false }] });
+            await new Promise(r => setTimeout(r, 15));
+
+            const recentSuffixes = harness.recorded.foreignStateWrites.slice(writesBefore).map(w => w[0]);
+            expect(recentSuffixes).to.not.include('hue.0.Tradfri_test.ct');
+            expect(recentSuffixes).to.include('hue.0.Tradfri_test.on');
+
+            await new Promise(resolve => adapter.onUnload(resolve));
         } finally {
             harness.cleanup();
         }
