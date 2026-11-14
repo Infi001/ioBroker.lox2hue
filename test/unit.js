@@ -186,11 +186,16 @@ describe('commandLogic', () => {
             expect(cmd.writes.find(w => w.suffix === '.ct').value).to.equal(Math.round(1000000 / 454));
         });
 
-        it('maps switches and returns null for unknown devices', () => {
-            expect(
-                computeRawCommand({ inputVal: true, type: switchType, isTradfri: false, wasOn: false, config: baseConfig })
-                    .writes,
-            ).to.deep.equal([{ suffix: '.on', value: true }]);
+        it('maps switches as non-groupable direct writes and returns null for unknown devices', () => {
+            const switchCmd = computeRawCommand({
+                inputVal: true,
+                type: switchType,
+                isTradfri: false,
+                wasOn: false,
+                config: baseConfig,
+            });
+            expect(switchCmd.groupable).to.be.false;
+            expect(switchCmd.writes).to.deep.equal([{ suffix: '.on', value: true }]);
             expect(
                 computeRawCommand({ inputVal: 100, type: unknownType, isTradfri: false, wasOn: false, config: baseConfig }),
             ).to.be.null;
@@ -212,7 +217,7 @@ describe('commandLogic', () => {
             expect(action.color.xy).to.have.all.keys('x', 'y');
         });
 
-        it('builds pure on/off action for smart plugs without dimming', () => {
+        it('excludes switches from bridge scene actions while supporting pure groupable on/off writes', () => {
             const cmd = computeRawCommand({
                 inputVal: true,
                 type: switchType,
@@ -220,7 +225,10 @@ describe('commandLogic', () => {
                 wasOn: false,
                 config: baseConfig,
             });
-            expect(commandToClipV2Action(cmd, { hasDimming: false })).to.deep.equal({ on: { on: true } });
+            expect(commandToClipV2Action(cmd, { hasDimming: false })).to.be.null;
+            expect(
+                commandToClipV2Action({ ...cmd, groupable: true }, { hasDimming: false }),
+            ).to.deep.equal({ on: { on: true } });
         });
 
         it('clamps white-ambiance mirek against bridge mirek_schema', () => {
@@ -655,6 +663,11 @@ describe('Loxone2Hue adapter end-to-end (mocked ioBroker + CLIP v2 bridge)', () 
             );
             expect(recalls).to.have.lengthOf(1);
             expect(recalls[0].body.recall).to.deep.equal({ action: 'active', duration: 700 });
+            const plugCalls = harness.recorded.httpCalls.filter(
+                c => c.method === 'PUT' && c.path === '/clip/v2/resource/light/v2-l3',
+            );
+            expect(plugCalls).to.have.lengthOf(1);
+            expect(plugCalls[0].body).to.deep.equal({ on: { on: true } });
 
             // Timeout recovery: if scene POST times out after bridge creation, deduplicate by name
             harness.setFailNextScenePost(true);
@@ -702,7 +715,27 @@ describe('Loxone2Hue adapter end-to-end (mocked ioBroker + CLIP v2 bridge)', () 
             version: 2,
             rooms: {
                 'loxone.0.roomA': {
-                    9: { lights: {}, fingerprint: 'fp9', bridgeSceneId: 'scene-dyn' },
+                    9: {
+                        lights: {
+                            'hue.0.rgb1': {
+                                groupable: true,
+                                isOff: false,
+                                writes: [{ suffix: '.command', value: '{"on":true,"xy":[0.45,0.4],"level":50}' }],
+                            },
+                            'hue.0.ct2': {
+                                groupable: true,
+                                isOff: true,
+                                writes: [{ suffix: '.command', value: '{"on":false}' }],
+                            },
+                            'hue.0.plug3': {
+                                groupable: true,
+                                isOff: true,
+                                writes: [{ suffix: '.on', value: false }],
+                            },
+                        },
+                        fingerprint: 'fp9',
+                        bridgeSceneId: 'scene-dyn',
+                    },
                 },
             },
         });
@@ -716,7 +749,7 @@ describe('Loxone2Hue adapter end-to-end (mocked ioBroker + CLIP v2 bridge)', () 
             await adapter.onReady();
 
             expect(adapter.sceneCache.rooms['loxone.0.roomA']['9'].bridgeSceneId).to.equal('scene-dyn');
-            expect(adapter.ownStates['cache.scenes']?.val).to.equal(legacyPayload);
+            expect(adapter.sceneCache.rooms['loxone.0.roomA']['9'].lights['hue.0.plug3'].groupable).to.be.false;
 
             await adapter.markDynamic('loxone.0.roomA', '9');
             const deleteCalls = harness.recorded.httpCalls.filter(

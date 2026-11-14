@@ -275,7 +275,7 @@ class Loxone2Hue extends utils.Adapter {
         const ids = new Set();
         for (const member of room.members) {
             const cap = this.deviceCapabilities[member.hueId];
-            if (!cap || cap.isGroup || !cap.bridgeId || /tradfri/i.test(member.hueId)) {
+            if (!cap || cap.isGroup || cap.isSwitch || !cap.bridgeId || /tradfri/i.test(member.hueId)) {
                 continue;
             }
             const v2Light = this.v2LightsByV1Id.get(String(cap.bridgeId));
@@ -406,6 +406,7 @@ class Loxone2Hue extends utils.Adapter {
                     }
                     await this.initClipV2Resources();
                     this.v2Initialized = true;
+                    await this.migrateSwitchEntriesInCache();
                     return true;
                 } catch (e) {
                     this.log.error(`[SZENE] CLIP v2 Initialisierung fehlgeschlagen: ${e.message}`);
@@ -455,6 +456,33 @@ class Loxone2Hue extends utils.Adapter {
         }
         if (orphans.length > 0) {
             this.log.info(`[SZENE] ${orphans.length} verwaiste CLIP v2 Cache-Szenen bereinigt.`);
+        }
+    }
+
+    async migrateSwitchEntriesInCache() {
+        for (const [roomKey, roomCache] of Object.entries(this.sceneCache.rooms)) {
+            if (!roomCache || typeof roomCache !== 'object') {
+                continue;
+            }
+            for (const [moodKey, entry] of Object.entries(roomCache)) {
+                if (!entry || entry.dynamic || !entry.lights) {
+                    continue;
+                }
+                const hasStaleSwitch = Object.entries(entry.lights).some(
+                    ([hueId, cmd]) => cmd && cmd.groupable !== false && this.deviceCapabilities[hueId]?.isSwitch,
+                );
+                if (!hasStaleSwitch) {
+                    continue;
+                }
+                for (const [hueId, cmd] of Object.entries(entry.lights)) {
+                    if (cmd && this.deviceCapabilities[hueId]?.isSwitch) {
+                        cmd.groupable = false;
+                    }
+                }
+                const bridgeSceneId = await this.upsertBridgeScene(roomKey, moodKey, entry.lights, entry);
+                entry.bridgeSceneId = bridgeSceneId || undefined;
+                this.saveSceneCacheDebounced();
+            }
         }
     }
 
@@ -880,9 +908,16 @@ class Loxone2Hue extends utils.Adapter {
         await this.ensureClipV2Ready();
         const fingerprint = commandLogic.snapshotFingerprint(snap);
         const needsBridgeScene = this.buildClipV2Actions(snap).length >= (this.config.sceneMinLights ?? 2);
+        const groupableChanged =
+            existingEntry &&
+            existingEntry.lights &&
+            Object.keys(snap).some(
+                k => existingEntry.lights[k] && existingEntry.lights[k].groupable !== snap[k].groupable,
+            );
 
         if (
             existingEntry &&
+            !groupableChanged &&
             existingEntry.fingerprint === fingerprint &&
             (!needsBridgeScene || existingEntry.bridgeSceneId)
         ) {
@@ -965,10 +1000,26 @@ class Loxone2Hue extends utils.Adapter {
             });
             await Promise.all(
                 lightEntries
-                    .filter(([, cmd]) => cmd && cmd.groupable === false)
-                    .map(([hueId, cmd]) => {
+                    .filter(
+                        ([hueId, cmd]) => cmd && (cmd.groupable === false || this.deviceCapabilities[hueId]?.isSwitch),
+                    )
+                    .map(async ([hueId, cmd]) => {
                         const type = this.deviceCapabilities[hueId];
-                        return type ? this.applyCommand(hueId, type.cmdPrefix, cmd) : null;
+                        if (!type) {
+                            return;
+                        }
+                        if (type.isSwitch) {
+                            try {
+                                if (await this.setClipV2OnOff(hueId, type, !cmd.isOff)) {
+                                    return;
+                                }
+                            } catch (e) {
+                                this.log.debug(
+                                    `[SZENE] CLIP v2 Direktbefehl für ${hueId} fehlgeschlagen (${e.message}), nutze Fallback.`,
+                                );
+                            }
+                        }
+                        await this.applyCommand(hueId, type.cmdPrefix, cmd);
                     }),
             );
         } catch (e) {
@@ -984,15 +1035,22 @@ class Loxone2Hue extends utils.Adapter {
     // ---------------------------------------------------------------
     // Off watchdog
     // ---------------------------------------------------------------
-    async forceTurnOffDevice(hueId, type, cmd) {
+    async setClipV2OnOff(hueId, type, onState) {
         const v2Light = !type.isGroup && type.bridgeId && this.v2LightsByV1Id.get(String(type.bridgeId));
-        if (v2Light) {
-            try {
-                await this.clipV2Request('PUT', `/resource/light/${v2Light.id}`, { on: { on: false } });
+        if (!v2Light) {
+            return false;
+        }
+        await this.clipV2Request('PUT', `/resource/light/${v2Light.id}`, { on: { on: !!onState } });
+        return true;
+    }
+
+    async forceTurnOffDevice(hueId, type, cmd) {
+        try {
+            if (await this.setClipV2OnOff(hueId, type, false)) {
                 return;
-            } catch (e) {
-                this.log.warn(`[WÄCHTER] CLIP v2 Aus für ${hueId} fehlgeschlagen (${e.message}), nutze Fallback.`);
             }
+        } catch (e) {
+            this.log.warn(`[WÄCHTER] CLIP v2 Aus für ${hueId} fehlgeschlagen (${e.message}), nutze Fallback.`);
         }
         const onStateId = `${hueId + type.cmdPrefix}.on`;
         if (await this.stateExists(onStateId)) {
